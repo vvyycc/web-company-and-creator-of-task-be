@@ -1,2 +1,21 @@
 # web-company-and-creator-of-task-be
-This part will manage the email send for the clients, divide the project in tasks, and post the project divided for the coders can start to pick task.
+
+Backend en Node.js/Express para gestionar el formulario de contacto de la web estática. Expone un endpoint `POST /contact` que valida los campos y envía un correo a la empresa mediante Nodemailer.
+
+## Requisitos
+- Node.js 18+
+- Variables de entorno configuradas (ver `.env.example`).
+
+## Instalación y uso
+```
+npm install
+npm run dev
+```
+El servidor se levanta por defecto en `http://localhost:4000` y permite CORS desde `FRONTEND_ORIGIN` o `http://localhost:3000`.
+
+## Variables de entorno
+Copia `.env.example` a `.env` y ajusta los valores:
+- `PORT`: Puerto de escucha (por defecto 4000).
+- `FRONTEND_ORIGIN`: Dominio permitido para CORS.
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`: Credenciales SMTP.
+- `CONTACT_RECIPIENT`: Correo de destino donde se reciben los mensajes.
