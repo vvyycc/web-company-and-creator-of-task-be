@@ -1,84 +1,134 @@
 import { Router, Request, Response } from 'express';
-import { PLATFORM_FEE_PERCENT, TASK_GENERATOR_FIXED_PRICE_EUR } from '../config/pricing';
-import { createProject, getProject, publishProject, Project, Task } from '../models/project';
+import { HOURLY_RATE, PLATFORM_FEE_PERCENT, TASK_GENERATOR_FIXED_PRICE_EUR } from '../config/pricing';
+import {
+  createProject,
+  GeneratedTask,
+  getProject,
+  Project,
+  ProjectEstimation,
+  publishProject,
+  TaskCategory,
+  TaskComplexity,
+} from '../models/project';
 
 interface GenerateTasksRequestBody {
   ownerEmail?: string;
-  title?: string;
-  description?: string;
+  projectTitle?: string;
+  projectDescription?: string;
+  title?: string; // alias legacy para compatibilidad
+  description?: string; // alias legacy para compatibilidad
 }
 
 const router = Router();
 
-const buildSampleTasks = (projectTitle: string, projectDescription: string): Omit<Task, 'id'>[] => [
+const categoryRules: Record<
+  TaskCategory,
   {
-    projectId: '',
-    title: 'Definir arquitectura y stack tecnológico',
-    description: `Arquitectura inicial para el proyecto: ${projectTitle}. ${projectDescription}`,
-    priority: 1,
-    price: 200,
-    layer: 'ARCHITECTURE',
-  },
-  {
-    projectId: '',
-    title: 'Diseñar modelos de datos y esquema de base de datos',
-    description: 'Modelado de entidades principales y relaciones.',
-    priority: 2,
-    price: 150,
-    layer: 'MODEL',
-  },
-  {
-    projectId: '',
-    title: 'Implementar servicios y lógica de negocio',
-    description: 'Endpoints y casos de uso principales del proyecto.',
-    priority: 3,
-    price: 250,
-    layer: 'SERVICE',
-  },
-  {
-    projectId: '',
-    title: 'Desarrollar capa de vista / frontend',
-    description: 'Pantallas iniciales y flujos de usuario clave.',
-    priority: 4,
-    price: 180,
-    layer: 'VIEW',
-  },
-];
+    complexity: TaskComplexity;
+    estimatedHours: number;
+  }
+> = {
+  ARCHITECTURE: { complexity: 'HIGH', estimatedHours: 8 },
+  MODEL: { complexity: 'MEDIUM', estimatedHours: 4 },
+  SERVICE: { complexity: 'HIGH', estimatedHours: 7 },
+  VIEW: { complexity: 'MEDIUM', estimatedHours: 4 },
+  INFRA: { complexity: 'MEDIUM', estimatedHours: 3 },
+  QA: { complexity: 'SIMPLE', estimatedHours: 2 },
+};
+
+const fallbackRule: { complexity: TaskComplexity; estimatedHours: number } = { complexity: 'MEDIUM', estimatedHours: 4 };
+
+const getTaskEstimation = (category: TaskCategory) => categoryRules[category] ?? fallbackRule;
+
+const buildSampleTasks = (projectTitle: string, projectDescription: string): Omit<GeneratedTask, 'id'>[] => {
+  const templates: Array<Pick<GeneratedTask, 'title' | 'description' | 'category'>> = [
+    {
+      title: 'Definir arquitectura y stack tecnológico',
+      description: `Arquitectura inicial para el proyecto: ${projectTitle}. ${projectDescription}`,
+      category: 'ARCHITECTURE',
+    },
+    {
+      title: 'Diseñar modelos de datos y esquema de base de datos',
+      description: 'Modelado de entidades principales y relaciones.',
+      category: 'MODEL',
+    },
+    {
+      title: 'Implementar servicios y lógica de negocio',
+      description: 'Endpoints y casos de uso principales del proyecto.',
+      category: 'SERVICE',
+    },
+    {
+      title: 'Desarrollar capa de vista / frontend',
+      description: 'Pantallas iniciales y flujos de usuario clave.',
+      category: 'VIEW',
+    },
+  ];
+
+  return templates.map((template, index) => {
+    const { complexity, estimatedHours } = getTaskEstimation(template.category);
+    const taskPrice = Math.round(estimatedHours * HOURLY_RATE);
+    return {
+      ...template,
+      complexity,
+      estimatedHours,
+      hourlyRate: HOURLY_RATE,
+      taskPrice,
+      priority: index + 1,
+      // Mantenemos alias legacy para integraciones previas.
+      layer: template.category,
+      price: taskPrice,
+    } satisfies Omit<GeneratedTask, 'id'>;
+  });
+};
 
 router.post(
   '/generate-tasks',
   async (
     req: Request<unknown, unknown, GenerateTasksRequestBody>,
-    res: Response<{ project: Project; pricing: { taskGeneratorFixedPriceEur: number; platformFeePercent: number } } | { error: string }>
+    res: Response<{ project: ProjectEstimation & { id: string; published: boolean } } | { error: string }>
   ) => {
     try {
-      const { ownerEmail, title, description } = req.body || {};
+      const { ownerEmail, projectTitle, projectDescription, title, description } = req.body || {};
 
-      if (!ownerEmail || !title || !description) {
-        return res.status(400).json({ error: 'ownerEmail, title y description son obligatorios' });
+      const resolvedTitle = projectTitle ?? title;
+      const resolvedDescription = projectDescription ?? description;
+
+      if (!ownerEmail || !resolvedTitle || !resolvedDescription) {
+        return res.status(400).json({ error: 'ownerEmail, projectTitle y projectDescription son obligatorios' });
       }
 
-      const tasksWithoutIds = buildSampleTasks(title, description);
-      const totalTasksPrice = tasksWithoutIds.reduce((sum, task) => sum + task.price, 0);
+      const tasksWithoutIds = buildSampleTasks(resolvedTitle, resolvedDescription);
+      const totalHours = tasksWithoutIds.reduce((sum, task) => sum + task.estimatedHours, 0);
+      const grossTotalTasksPrice = tasksWithoutIds.reduce((sum, task) => sum + task.taskPrice, 0);
+      // La plataforma actúa como intermediaria y retiene un 1% del presupuesto del proyecto.
+      const platformFeeAmount = Math.round(grossTotalTasksPrice * (PLATFORM_FEE_PERCENT / 100));
+      const generatorServiceFee = TASK_GENERATOR_FIXED_PRICE_EUR; // Fee fijo por uso del generador (30 €)
+      const grandTotalClientCost = grossTotalTasksPrice + platformFeeAmount + generatorServiceFee;
+
+      const tasksWithDeveloperShare = tasksWithoutIds.map((task) => {
+        const proportionalFee = grossTotalTasksPrice === 0 ? 0 : (task.taskPrice / grossTotalTasksPrice) * platformFeeAmount;
+        const developerNetPrice = Math.max(0, Math.round(task.taskPrice - proportionalFee));
+        return { ...task, price: developerNetPrice, developerNetPrice };
+      });
 
       const project = createProject({
         ownerEmail,
-        title,
-        description,
-        tasks: tasksWithoutIds,
-        totalTasksPrice,
-        generatorFee: TASK_GENERATOR_FIXED_PRICE_EUR,
+        projectTitle: resolvedTitle,
+        projectDescription: resolvedDescription,
+        title: resolvedTitle,
+        description: resolvedDescription,
+        tasks: tasksWithDeveloperShare,
+        totalHours,
+        totalTasksPrice: grossTotalTasksPrice,
         platformFeePercent: PLATFORM_FEE_PERCENT,
+        platformFeeAmount,
+        generatorServiceFee,
+        generatorFee: generatorServiceFee,
+        grandTotalClientCost,
         published: false,
       });
 
-      return res.status(200).json({
-        project,
-        pricing: {
-          taskGeneratorFixedPriceEur: TASK_GENERATOR_FIXED_PRICE_EUR,
-          platformFeePercent: PLATFORM_FEE_PERCENT,
-        },
-      });
+      return res.status(200).json({ project });
     } catch (error) {
       console.error('Error generando tareas:', error);
       return res.status(500).json({ error: 'Error interno al generar tareas' });
