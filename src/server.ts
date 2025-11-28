@@ -2,6 +2,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import express, { Request, Response } from 'express';
 import { sendContactEmail, ContactMessage } from './services/mailer';
+import projectsRouter from './routes/projects';
 
 dotenv.config();
 
@@ -11,7 +12,7 @@ app.use(express.json());
 app.use(
   cors({
     origin: process.env.FRONTEND_ORIGIN || 'http://localhost:3000',
-    methods: ['POST', 'OPTIONS'],
+    methods: ['GET', 'POST', 'OPTIONS'],
   })
 );
 
@@ -63,6 +64,8 @@ app.post('/contact', async (req: Request<unknown, unknown, ContactRequestBody>, 
       .json({ success: false, message: 'No se pudo enviar el mensaje. Inténtalo más tarde.' });
   }
 });
+
+app.use('/projects', projectsRouter);
 
 const PORT = Number(process.env.PORT) || 4000;
 app.listen(PORT, () => {
