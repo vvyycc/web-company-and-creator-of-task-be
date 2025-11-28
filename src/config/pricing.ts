@@ -1,0 +1,2 @@
+export const TASK_GENERATOR_FIXED_PRICE_EUR = 30;
+export const PLATFORM_FEE_PERCENT = 1;
