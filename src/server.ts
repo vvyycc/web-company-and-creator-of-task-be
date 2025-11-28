@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 import express, { Request, Response } from 'express';
 import { sendContactEmail, ContactMessage } from './services/mailer';
 import projectsRouter from './routes/projects';
+import stripeRouter from './routes/stripe';
 
 dotenv.config();
 
@@ -66,6 +67,7 @@ app.post('/contact', async (req: Request<unknown, unknown, ContactRequestBody>, 
 });
 
 app.use('/projects', projectsRouter);
+app.use('/stripe', stripeRouter);
 
 const PORT = Number(process.env.PORT) || 4000;
 app.listen(PORT, () => {

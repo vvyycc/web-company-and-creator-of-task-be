@@ -1,34 +1,58 @@
 import { randomUUID } from 'crypto';
 
-export type TaskLayer = 'ARCHITECTURE' | 'MODEL' | 'SERVICE' | 'VIEW';
+export type TaskComplexity = 'SIMPLE' | 'MEDIUM' | 'HIGH';
 
-export interface Task {
-  id: string;
-  projectId: string;
+export type TaskCategory = 'ARCHITECTURE' | 'MODEL' | 'SERVICE' | 'VIEW' | 'INFRA' | 'QA';
+
+export interface GeneratedTask {
+  id: string; // uuid
   title: string;
   description: string;
-  priority: number;
-  price: number;
-  layer: TaskLayer;
+  category: TaskCategory; // ARCHITECTURE, MODEL, SERVICE, VIEW, ...
+  complexity: TaskComplexity;
+  priority: number; // 1, 2, 3, ...
+  estimatedHours: number; // horas estimadas para esa tarea
+  hourlyRate: number; // siempre 30
+  taskPrice: number; // estimatedHours * hourlyRate
+  // Alias legacy para mantener compatibilidad con integraciones previas.
+  layer?: TaskCategory;
+  price?: number;
+  developerNetPrice?: number;
 }
 
-export interface Project {
-  id: string;
+export interface ProjectEstimation {
+  projectTitle: string;
+  projectDescription: string;
   ownerEmail: string;
-  title: string;
-  description: string;
-  tasks: Task[];
-  totalTasksPrice: number;
-  generatorFee: number;
-  platformFeePercent: number;
+  tasks: GeneratedTask[];
+  totalHours: number; // suma de estimatedHours
+  totalTasksPrice: number; // suma de taskPrice
+  platformFeePercent: number; // siempre 1
+  platformFeeAmount: number; // totalTasksPrice * 0.01
+  generatorServiceFee: number; // fijo 30 €
+  grandTotalClientCost: number; // totalTasksPrice + platformFeeAmount + generatorServiceFee
+  // Alias legacy para compatibilidad con clientes anteriores.
+  title?: string;
+  description?: string;
+  generatorFee?: number;
+}
+
+export interface Project extends ProjectEstimation {
+  id: string;
   published: boolean;
 }
 
 const projects = new Map<string, Project>();
 
-export const createProject = (data: Omit<Project, 'id' | 'tasks'> & { tasks: Omit<Task, 'id'>[] }): Project => {
+export const createProject = (
+  data: Omit<Project, 'id' | 'tasks' | 'platformFeeAmount' | 'grandTotalClientCost'> & {
+    tasks: Omit<GeneratedTask, 'id'>[];
+    platformFeeAmount: number;
+    grandTotalClientCost: number;
+  }
+): Project => {
   const projectId = randomUUID();
-  const tasks: Task[] = data.tasks.map((task) => ({ ...task, id: randomUUID(), projectId }));
+  const tasks: GeneratedTask[] = data.tasks.map((task, index) => ({ ...task, id: randomUUID(), priority: task.priority ?? index + 1 }));
 
   const project: Project = {
     ...data,
