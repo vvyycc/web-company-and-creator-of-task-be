@@ -4,18 +4,23 @@ import express, { Request, Response } from 'express';
 import { sendContactEmail, ContactMessage } from './services/mailer';
 import projectsRouter from './routes/projects';
 import stripeRouter from './routes/stripe';
+import billingRouter, { billingWebhookHandler } from './routes/billing';
+import communityRouter from './routes/community';
 
 dotenv.config();
 
 const app = express();
-
-app.use(express.json());
 app.use(
   cors({
     origin: process.env.FRONTEND_ORIGIN || 'http://localhost:3000',
     methods: ['GET', 'POST', 'OPTIONS'],
   })
 );
+
+// El webhook de Stripe necesita el raw body para validar la firma.
+app.post('/billing/webhook', express.raw({ type: 'application/json' }), billingWebhookHandler);
+
+app.use(express.json());
 
 const EMAIL_REGEX = /^[\w.+-]+@[\w-]+\.[\w.-]+$/i;
 
@@ -68,6 +73,8 @@ app.post('/contact', async (req: Request<unknown, unknown, ContactRequestBody>, 
 
 app.use('/projects', projectsRouter);
 app.use('/stripe', stripeRouter);
+app.use('/billing', billingRouter);
+app.use('/community', communityRouter);
 
 const PORT = Number(process.env.PORT) || 4000;
 app.listen(PORT, () => {

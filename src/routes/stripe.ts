@@ -1,12 +1,7 @@
 import { Router, Request, Response } from 'express';
-import Stripe from 'stripe';
+import { stripeClient } from '../config/stripe';
 
 const router = Router();
-
-const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
-
-// Stripe se utiliza únicamente para cobrar el fee fijo de 30 € por usar el generador de tareas.
-const stripeClient = stripeSecretKey ? new Stripe(stripeSecretKey, { apiVersion: '2024-06-20' }) : null;
 
 router.post('/checkout-session', async (_req: Request, res: Response) => {
   if (!stripeClient) {
