@@ -10,6 +10,8 @@ import {
   TaskCategory,
   TaskComplexity,
 } from '../models/project';
+import { connectMongo } from '../db/mongo';
+import { Subscription } from '../models/Subscription';
 
 interface GenerateTasksRequestBody {
   ownerEmail?: string;
@@ -95,6 +97,17 @@ router.post(
 
       if (!ownerEmail || !resolvedTitle || !resolvedDescription) {
         return res.status(400).json({ error: 'ownerEmail, projectTitle y projectDescription son obligatorios' });
+      }
+
+      // La suscripción mensual de 30 €/mes es obligatoria para usar el generador de tareas.
+      await connectMongo();
+      const subscription = await Subscription.findOne({ email: ownerEmail });
+      // Sin suscripción activa, devolvemos 402 subscription_required para bloquear el generador.
+      if (!subscription || subscription.status !== 'active') {
+        return res.status(402).json({
+          error: 'subscription_required',
+          message: 'Necesitas una suscripción activa de 30 €/mes para generar el troceado de tareas.',
+        });
       }
 
       const tasksWithoutIds = buildSampleTasks(resolvedTitle, resolvedDescription);

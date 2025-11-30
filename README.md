@@ -19,3 +19,5 @@ Copia `.env.example` a `.env` y ajusta los valores:
 - `FRONTEND_ORIGIN`: Dominio permitido para CORS.
 - `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`: Credenciales SMTP.
 - `CONTACT_RECIPIENT`: Correo de destino donde se reciben los mensajes.
+- `MONGO_URI`: Cadena de conexión a MongoDB.
+- `STRIPE_SECRET_KEY`, `STRIPE_SUBSCRIPTION_PRICE_ID`, `STRIPE_SUBSCRIPTION_SUCCESS_URL`, `STRIPE_SUBSCRIPTION_CANCEL_URL`, `STRIPE_WEBHOOK_SECRET`: Configuración de Stripe para la suscripción mensual de 30 €.
