@@ -7,6 +7,8 @@ import {
   Project,
   ProjectEstimation,
   publishProject,
+  ColumnId,
+  findTaskById,
   TaskCategory,
   TaskComplexity,
 } from '../models/project';
@@ -41,6 +43,14 @@ const categoryRules: Record<
 const fallbackRule: { complexity: TaskComplexity; estimatedHours: number } = { complexity: 'MEDIUM', estimatedHours: 4 };
 
 const getTaskEstimation = (category: TaskCategory) => categoryRules[category] ?? fallbackRule;
+
+export const DEFAULT_COLUMNS: Array<{ id: ColumnId; title: string; order: number }> = [
+  { id: 'todo', title: 'Por hacer', order: 1 },
+  { id: 'doing', title: 'Haciendo', order: 2 },
+  { id: 'done', title: 'Hecho', order: 3 },
+];
+
+const isValidColumnId = (columnId: string): columnId is ColumnId => DEFAULT_COLUMNS.some((column) => column.id === columnId);
 
 const buildSampleTasks = (projectTitle: string, projectDescription: string): Omit<GeneratedTask, 'id'>[] => {
   const templates: Array<Pick<GeneratedTask, 'title' | 'description' | 'category'>> = [
@@ -79,6 +89,7 @@ const buildSampleTasks = (projectTitle: string, projectDescription: string): Omi
       // Mantenemos alias legacy para integraciones previas.
       layer: template.category,
       price: taskPrice,
+      columnId: 'todo',
     } satisfies Omit<GeneratedTask, 'id'>;
   });
 };
@@ -121,7 +132,7 @@ router.post(
       const tasksWithDeveloperShare = tasksWithoutIds.map((task) => {
         const proportionalFee = grossTotalTasksPrice === 0 ? 0 : (task.taskPrice / grossTotalTasksPrice) * platformFeeAmount;
         const developerNetPrice = Math.max(0, Math.round(task.taskPrice - proportionalFee));
-        return { ...task, price: developerNetPrice, developerNetPrice };
+        return { ...task, price: developerNetPrice, developerNetPrice, columnId: 'todo' };
       });
 
       const project = createProject({
@@ -162,6 +173,80 @@ router.get('/:id', (req: Request<{ id: string }>, res: Response<Project | { erro
     return res.status(500).json({ error: 'Error interno al obtener el proyecto' });
   }
 });
+
+router.get(
+  '/:id/board',
+  (
+    req: Request<{ id: string }>,
+    res: Response<
+      | {
+          project: { id: string; title: string; published: boolean };
+          columns: typeof DEFAULT_COLUMNS;
+          tasks: Array<
+            Pick<GeneratedTask, 'id' | 'title' | 'description' | 'price' | 'priority' | 'columnId'> & {
+              layer: TaskCategory;
+            }
+          >;
+        }
+      | { error: string }
+    >
+  ) => {
+    try {
+      const project = getProject(req.params.id);
+
+      if (!project) {
+        return res.status(404).json({ error: 'No encontrado' });
+      }
+
+      return res.status(200).json({
+        project: { id: project.id, title: project.projectTitle ?? project.title ?? '', published: project.published },
+        columns: DEFAULT_COLUMNS,
+        tasks: project.tasks.map((task) => ({
+          id: task.id,
+          title: task.title,
+          description: task.description,
+          price: task.price ?? task.taskPrice,
+          priority: task.priority,
+          layer: task.layer ?? task.category,
+          columnId: task.columnId,
+        })),
+      });
+    } catch (error) {
+      console.error('Error obteniendo tablero de proyecto:', error);
+      return res.status(500).json({ error: 'Error interno al obtener el tablero del proyecto' });
+    }
+  }
+);
+
+router.patch(
+  '/tasks/:id/move',
+  (
+    req: Request<{ id: string }, unknown, { columnId?: ColumnId }>,
+    res: Response<GeneratedTask | { error: string }>
+  ) => {
+    try {
+      const { columnId } = req.body || {};
+
+      if (!columnId || !isValidColumnId(columnId)) {
+        return res.status(400).json({ error: 'Columna inválida' });
+      }
+
+      const result = findTaskById(req.params.id);
+
+      if (!result) {
+        return res.status(404).json({ error: 'No encontrado' });
+      }
+
+      result.task.columnId = columnId;
+      result.project.tasks = result.project.tasks.map((task) => (task.id === result.task.id ? result.task : task));
+
+      return res.status(200).json(result.task);
+    } catch (error) {
+      console.error('Error moviendo tarea de columna:', error);
+      return res.status(500).json({ error: 'Error interno al mover la tarea' });
+    }
+  }
+);
 
 router.post('/:id/publish', (req: Request<{ id: string }>, res: Response<Project | { error: string; explanation?: string }>) => {
   try {

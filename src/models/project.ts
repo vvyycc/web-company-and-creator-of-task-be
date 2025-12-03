@@ -4,6 +4,8 @@ export type TaskComplexity = 'SIMPLE' | 'MEDIUM' | 'HIGH';
 
 export type TaskCategory = 'ARCHITECTURE' | 'MODEL' | 'SERVICE' | 'VIEW' | 'INFRA' | 'QA';
 
+export type ColumnId = 'todo' | 'doing' | 'done';
+
 export interface GeneratedTask {
   id: string; // uuid
   title: string;
@@ -18,6 +20,7 @@ export interface GeneratedTask {
   layer?: TaskCategory;
   price?: number;
   developerNetPrice?: number;
+  columnId: ColumnId;
 }
 
 export interface ProjectEstimation {
@@ -52,7 +55,12 @@ export const createProject = (
   }
 ): Project => {
   const projectId = randomUUID();
-  const tasks: GeneratedTask[] = data.tasks.map((task, index) => ({ ...task, id: randomUUID(), priority: task.priority ?? index + 1 }));
+  const tasks: GeneratedTask[] = data.tasks.map((task, index) => ({
+    ...task,
+    id: randomUUID(),
+    priority: task.priority ?? index + 1,
+    columnId: task.columnId ?? 'todo',
+  }));
 
   const project: Project = {
     ...data,
@@ -73,4 +81,21 @@ export const publishProject = (id: string): Project | undefined => {
   project.published = true;
   projects.set(id, project);
   return project;
+};
+
+export const findTaskById = (
+  taskId: string
+):
+  | {
+      project: Project;
+      task: GeneratedTask;
+    }
+  | undefined => {
+  for (const project of projects.values()) {
+    const task = project.tasks.find((t) => t.id === taskId);
+    if (task) {
+      return { project, task };
+    }
+  }
+  return undefined;
 };
