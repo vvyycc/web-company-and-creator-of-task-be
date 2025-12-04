@@ -2,128 +2,128 @@
 import express, { Request, Response } from 'express';
 import { connectMongo } from '../db/mongo';
 import { CommunityProject } from '../models/CommunityProject';
-import { GeneratedTask, TaskCategory, ColumnId } from '../models/project';
+import { GeneratedTask, TaskCategory, ColumnId, Project } from '../models/project';
 
 const router = express.Router();
+function getProject(id: string): Project | undefined {
+  const projects= new Map<string, Project>();
+ 
+  return  projects.get(id);
+}
 
-const DEFAULT_COLUMNS: Array<{ id: ColumnId; title: string; order: number }> = [
+function publishProject(id: string): Project | undefined {
+  const projects= new Map<string, Project>();
+  const project = projects.get(id);
+  if (!project) return undefined;
+  project.published = true;
+  project.publishedAt = new Date();
+  projects.set(id, project);
+  return project;
+}
+
+function listPublishedProjects() {
+  const projects= new Map<string, Project>();
+  return Array.from(projects.values()).filter(project => project.published);
+}
+
+const BOARD_COLUMNS = [
   { id: 'todo', title: 'Por hacer', order: 1 },
   { id: 'doing', title: 'Haciendo', order: 2 },
   { id: 'done', title: 'Hecho', order: 3 },
 ];
 
-// POST /community/projects
-// Guarda el proyecto generado en la colección communityprojects
-router.post(
-  '/projects',
-  async (
-    req: Request<
-      unknown,
-      unknown,
-      {
-        ownerEmail?: string;
-        projectTitle?: string;
-        projectDescription?: string;
-        estimation?: any;
-      }
-    >,
-    res: Response<{ id: string; publicUrl: string } | { error: string }>
-  ) => {
-    try {
-      const { ownerEmail, projectTitle, projectDescription, estimation } = req.body || {};
+const mapTaskToBoard = (task: GeneratedTask) => ({
+  id: task.id,
+  title: task.title,
+  description: task.description,
+  price: task.price ?? task.taskPrice ?? 0,
+  priority: task.priority,
+  layer: task.layer ?? task.category,
+  columnId: task.columnId,
+});
 
-      if (!ownerEmail || !projectTitle || !projectDescription || !estimation) {
-        return res
-          .status(400)
-          .json({ error: 'ownerEmail, projectTitle, projectDescription y estimation son obligatorios' });
-      }
+const getProjectTitle = (project: Project): string => project.projectTitle ?? project.title ?? '';
 
-      await connectMongo();
+const getProjectDescription = (project: Project): string =>
+  project.projectDescription ?? project.description ?? '';
 
-      const doc = await CommunityProject.create({
-        ownerEmail,
-        projectTitle,
-        projectDescription,
-        estimation,
-        isPublished: true,
-      });
+router.post('/projects/:id/publish', (req: Request, res: Response) => {
+  const { id } = req.params;
 
-      const publicUrl = `/community/${doc._id.toString()}`;
-      return res.status(200).json({ id: doc._id.toString(), publicUrl });
-    } catch (error) {
-      console.error('[community] Error creando proyecto de comunidad:', error);
-      return res.status(500).json({ error: 'Error interno creando proyecto de comunidad' });
-    }
+  const project = publishProject(id);
+
+  if (!project) {
+    return res.status(404).json({ error: 'Proyecto no encontrado' });
   }
-);
 
-// GET /community/projects/:id/board
-// Devuelve datos para el tablero estilo Trello
-router.get(
-  '/projects/:id/board',
-  async (
-    req: Request<{ id: string }>,
-    res: Response<
-      | {
-          project: {
-            id: string;
-            title: string;
-            description: string;
-            ownerEmail: string;
-            published: boolean;
-          };
-          columns: typeof DEFAULT_COLUMNS;
-          tasks: Array<
-            Pick<GeneratedTask, 'id' | 'title' | 'description' | 'priority' | 'columnId'> & {
-              layer: TaskCategory;
-              price: number;
-            }
-          >;
-        }
-      | { error: string }
-    >
-  ) => {
-    try {
-      await connectMongo();
-      const doc = await CommunityProject.findById(req.params.id).lean();
+  // TODO: verificar suscripción activa del owner antes de publicar
 
-      if (!doc) {
-        return res.status(404).json({ error: 'Proyecto de comunidad no encontrado' });
-      }
+  return res.json({
+    project,
+    message: 'Proyecto publicado en la comunidad correctamente',
+  });
+});
 
-      const estimation = doc.estimation as any;
+router.get('/projects', (_req: Request, res: Response) => {
+  const publishedProjects = listPublishedProjects();
 
-      const tasks: Array<
-        Pick<GeneratedTask, 'id' | 'title' | 'description' | 'priority' | 'columnId'> & {
-          layer: TaskCategory;
-          price: number;
-        }
-      > = (estimation?.tasks ?? []).map((task: any) => ({
-        id: task.id,
-        title: task.title,
-        description: task.description,
-        priority: task.priority,
-        layer: (task.layer ?? task.category) as TaskCategory,
-        columnId: (task.columnId as ColumnId) ?? 'todo',
-        price: task.taskPrice ?? task.price ?? 0,
-      }));
+  const response = publishedProjects.map((project: Project) => ({
+    id: project.id,
+    title: getProjectTitle(project),
+    description: getProjectDescription(project),
+    totalTasksPrice: project.totalTasksPrice,
+    platformFeePercent: project.platformFeePercent,
+    publishedAt: project.publishedAt,
+    tasksCount: project.tasks.length,
+  }));
 
-      return res.status(200).json({
-        project: {
-          id: doc._id.toString(),
-          title: doc.projectTitle,
-          description: doc.projectDescription,
-          ownerEmail: doc.ownerEmail,
-          published: doc.isPublished,
-        },
-        columns: DEFAULT_COLUMNS,
-        tasks,
-      });
-    } catch (error) {
-      console.error('[community] Error obteniendo tablero de comunidad:', error);
-      return res.status(500).json({ error: 'Error interno obteniendo tablero de comunidad' });
-    }
+  return res.json(response);
+});
+
+router.get('/projects/:id', (req: Request, res: Response) => {
+  const { id } = req.params;
+  const project: Project | undefined = getProject(id);
+
+  if (!project || !project.published) {
+    return res.status(404).json({ error: 'Proyecto no encontrado' });
   }
-);
+
+  return res.json({
+    project: {
+      id: project.id,
+      title: getProjectTitle(project),
+      description: getProjectDescription(project),
+      totalTasksPrice: project.totalTasksPrice,
+      generatorFee: project.generatorFee ?? project.generatorServiceFee,
+      platformFeePercent: project.platformFeePercent,
+      published: true,
+      publishedAt: project.publishedAt,
+      tasks: project.tasks.map((task) => ({
+        ...task,
+        price: task.price ?? task.taskPrice ?? 0,
+        layer: task.layer ?? task.category,
+      })),
+    },
+  });
+});
+
+router.get('/projects/:id/board', (req: Request, res: Response) => {
+  const { id } = req.params;
+  const project = getProject(id);
+
+  if (!project || !project.published) {
+    return res.status(404).json({ error: 'Proyecto no encontrado' });
+  }
+
+  return res.json({
+    project: {
+      id: project.id,
+      title: getProjectTitle(project),
+      published: true,
+    },
+    columns: BOARD_COLUMNS,
+    tasks: project.tasks.map(mapTaskToBoard),
+  });
+});
 
 export default router;
