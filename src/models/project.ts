@@ -43,17 +43,29 @@ export interface ProjectEstimation {
 export interface Project extends ProjectEstimation {
   id: string;
   published: boolean;
+  publishedAt?: Date;
 }
 
 const projects = new Map<string, Project>();
 
-export const createProject = (
-  data: Omit<Project, 'id' | 'tasks' | 'platformFeeAmount' | 'grandTotalClientCost'> & {
+type CreateProjectInput =
+  Omit<
+    Project,
+    | 'id'
+    | 'tasks'
+    | 'platformFeeAmount'
+    | 'grandTotalClientCost'
+    | 'published'
+    | 'publishedAt'
+  > & {
     tasks: Omit<GeneratedTask, 'id'>[];
     platformFeeAmount: number;
     grandTotalClientCost: number;
-  }
-): Project => {
+    published?: boolean;
+    publishedAt?: Date;
+  };
+
+export const createProject = (data: CreateProjectInput): Project => {
   const projectId = randomUUID();
   const tasks: GeneratedTask[] = data.tasks.map((task, index) => ({
     ...task,
@@ -66,6 +78,9 @@ export const createProject = (
     ...data,
     id: projectId,
     tasks,
+    generatorFee: data.generatorFee ?? data.generatorServiceFee,
+    published: data.published ?? false,
+    publishedAt: data.publishedAt,
   };
 
   projects.set(projectId, project);
@@ -79,9 +94,15 @@ export const publishProject = (id: string): Project | undefined => {
   if (!project) return undefined;
 
   project.published = true;
+  project.publishedAt = new Date();
   projects.set(id, project);
   return project;
 };
+
+export const listProjects = (): Project[] => Array.from(projects.values());
+
+export const listPublishedProjects = (): Project[] =>
+  listProjects().filter((project) => project.published);
 
 export const findTaskById = (
   taskId: string
