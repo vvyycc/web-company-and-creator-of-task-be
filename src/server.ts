@@ -6,6 +6,7 @@ import projectsRouter from './routes/projects';
 import stripeRouter from './routes/stripe';
 import billingRouter, { billingWebhookHandler } from './routes/billing';
 import communityRouter from './routes/community';
+import { connectMongo } from './db/mongo';
 
 dotenv.config();
 
@@ -77,8 +78,19 @@ app.use('/billing', billingRouter);
 app.use('/community', communityRouter);
 
 const PORT = Number(process.env.PORT) || 4000;
-app.listen(PORT, () => {
-  console.log(`Servidor de contacto escuchando en http://localhost:${PORT}`);
-});
+
+async function startServer() {
+  try {
+    await connectMongo();
+    app.listen(PORT, () => {
+      console.log(`Servidor de contacto escuchando en http://localhost:${PORT}`);
+    });
+  } catch (error) {
+    console.error('No se pudo iniciar el servidor:', error);
+    process.exit(1);
+  }
+}
+
+startServer();
 
 export default app;

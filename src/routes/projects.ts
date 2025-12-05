@@ -1,22 +1,15 @@
 // src/routes/projects.ts
 import express, { Request, Response } from 'express';
-import { HOURLY_RATE, PLATFORM_FEE_PERCENT } from '../config/pricing';
-import {
-  createProject,
-  GeneratedTask,
-  getProject,
-  Project,
-  ProjectEstimation,
-  publishProject,
-  ColumnId,
-  findTaskById,
-  TaskCategory,
-  TaskComplexity,
-} from '../models/project';
+import { HOURLY_RATE, PLATFORM_FEE_PERCENT, TASK_GENERATOR_FIXED_PRICE_EUR } from '../config/pricing';
 import { connectMongo } from '../db/mongo';
+import { ProjectModel, ProjectDocument } from '../models/Project';
 import { Subscription } from '../models/Subscription';
+import { TaskDocument } from '../models/Task';
 
 const router = express.Router();
+
+type ColumnId = TaskDocument['columnId'];
+type TaskLayer = TaskDocument['layer'];
 
 /**
  * Body esperado en /projects/generate-tasks
@@ -32,102 +25,85 @@ interface GenerateTasksRequestBody {
 
 // --- columnas del "board" tipo Trello ---
 export const DEFAULT_COLUMNS: Array<{ id: ColumnId; title: string; order: number }> = [
-  { id: 'todo' as ColumnId, title: 'Por hacer', order: 1 },
-  { id: 'doing' as ColumnId, title: 'Haciendo', order: 2 },
-  { id: 'done' as ColumnId, title: 'Hecho', order: 3 },
+  { id: 'todo', title: 'Por hacer', order: 1 },
+  { id: 'doing', title: 'Haciendo', order: 2 },
+  { id: 'done', title: 'Hecho', order: 3 },
 ];
 
 const isValidColumnId = (columnId: string): columnId is ColumnId =>
   DEFAULT_COLUMNS.some((column) => column.id === columnId);
 
-// --- reglas por categoría para estimar horas y complejidad ---
+// --- reglas por categoría para estimar horas ---
 const categoryRules: Record<
-  TaskCategory,
-  { hours: number; complexity: TaskComplexity }
+  TaskLayer,
+  { hours: number }
 > = {
-  ARCHITECTURE: { hours: 6, complexity: 'HIGH' },
-  MODEL: { hours: 4, complexity: 'MEDIUM' },
-  SERVICE: { hours: 3, complexity: 'MEDIUM' },
-  VIEW: { hours: 2, complexity: 'SIMPLE' },
-  INFRA: { hours: 3, complexity: 'MEDIUM' },
-  QA: { hours: 1, complexity: 'SIMPLE' },
+  ARCHITECTURE: { hours: 6 },
+  MODEL: { hours: 4 },
+  SERVICE: { hours: 3 },
+  VIEW: { hours: 2 },
 };
 
-const fallbackRule: { hours: number; complexity: TaskComplexity } = {
-  hours: 4,
-  complexity: 'MEDIUM',
-};
-
-const getTaskEstimation = (category: TaskCategory) =>
-  categoryRules[category] ?? fallbackRule;
-
-/**
- * Construye un conjunto de tareas de ejemplo a partir del título y descripción.
- * Devuelve tasks SIN id → Omit<GeneratedTask, 'id'>[]
- */
 const buildSampleTasks = (
   projectTitle: string,
   projectDescription: string
-): Omit<GeneratedTask, 'id'>[] => {
-  const templates: Array<Pick<GeneratedTask, 'title' | 'description' | 'category'>> = [
+): Array<Omit<TaskDocument, '_id'>> => {
+  const templates: Array<Pick<TaskDocument, 'title' | 'description' | 'layer'>> = [
     {
       title: 'Definir arquitectura y stack tecnológico',
       description: `Arquitectura inicial para el proyecto: ${projectTitle}. ${projectDescription}`,
-      category: 'ARCHITECTURE',
+      layer: 'ARCHITECTURE',
     },
     {
       title: 'Diseñar modelos de datos y esquema de base de datos',
       description: 'Modelado de entidades principales y relaciones.',
-      category: 'MODEL',
+      layer: 'MODEL',
     },
     {
       title: 'Implementar servicios y lógica de negocio',
       description: 'Endpoints y casos de uso principales del proyecto.',
-      category: 'SERVICE',
+      layer: 'SERVICE',
     },
     {
       title: 'Desarrollar capa de vista / frontend',
       description: 'Pantallas iniciales y flujos de usuario clave.',
-      category: 'VIEW',
+      layer: 'VIEW',
     },
   ];
 
   return templates.map((template, index) => {
-    const { hours, complexity } = getTaskEstimation(template.category);
-    const taskPrice = Math.round(hours * HOURLY_RATE);
+    const hours = categoryRules[template.layer].hours;
+    const price = Math.round(hours * HOURLY_RATE);
 
     return {
       title: template.title,
       description: template.description,
-      category: template.category,
-      complexity,
       priority: index + 1,
-      estimatedHours: hours,
-      hourlyRate: HOURLY_RATE,
-      taskPrice,
-      // alias legacy y campos extra que el modelo GeneratedTask ya contempla
-      layer: template.category,
-      price: taskPrice,
+      price,
+      layer: template.layer,
       columnId: 'todo' as ColumnId,
-      // developerNetPrice se rellenará luego en función de la comisión de plataforma
-      developerNetPrice: taskPrice,
     };
   });
 };
 
+const formatProject = (project: ProjectDocument) => {
+  const data = project.toObject();
+  return {
+    ...data,
+    id: project._id.toString(),
+  };
+};
+
 /**
  * POST /projects/generate-tasks
- * Genera un proyecto con tareas troceadas, aplicando:
- * - check de suscripción (Subscription.status === 'active')
- * - horas por categoría
- * - comisión de plataforma 1%
+ * Genera un proyecto con tareas troceadas y lo guarda en MongoDB
  */
 router.post(
   '/generate-tasks',
   async (
     req: Request<unknown, unknown, GenerateTasksRequestBody>,
     res: Response<
-      | { project: ProjectEstimation & { id: string; published: boolean } }
+      | { project: ReturnType<typeof formatProject> }
       | { error: string; message?: string }
     >
   ) => {
@@ -150,7 +126,6 @@ router.post(
         });
       }
 
-      // 🔐 La suscripción mensual de 30 €/mes es obligatoria para usar el generador
       await connectMongo();
       const subscription = await Subscription.findOne({ email: ownerEmail });
 
@@ -162,74 +137,21 @@ router.post(
         });
       }
 
-      // 1) Generamos tareas base (sin ids)
-      const tasksWithoutIds = buildSampleTasks(resolvedTitle, resolvedDescription);
+      const tasks = buildSampleTasks(resolvedTitle, resolvedDescription);
+      const totalTasksPrice = tasks.reduce((sum, task) => sum + task.price, 0);
 
-      // 2) Cálculo de totales
-      const totalHours = tasksWithoutIds.reduce(
-        (sum, task) => sum + task.estimatedHours,
-        0
-      );
-      const grossTotalTasksPrice = tasksWithoutIds.reduce(
-        (sum, task) => sum + task.taskPrice,
-        0
-      );
-
-      // 3) Comisión de plataforma (1% del presupuesto del proyecto)
-      const platformFeeAmount = Math.round(
-        grossTotalTasksPrice * (PLATFORM_FEE_PERCENT / 100)
-      );
-
-      // 4) Fee del generador → 0 €, se paga por suscripción (no por presupuesto)
-      const generatorServiceFee = 0;
-
-      // 5) Importe total que vería el cliente
-      const grandTotalClientCost =
-        grossTotalTasksPrice + platformFeeAmount + generatorServiceFee;
-
-      // 6) Reparto de la comisión proporcional entre tareas
-      const tasksWithDeveloperShare: Omit<GeneratedTask, 'id'>[] =
-        tasksWithoutIds.map((task) => {
-          const proportionalFee =
-            grossTotalTasksPrice === 0
-              ? 0
-              : (task.taskPrice / grossTotalTasksPrice) * platformFeeAmount;
-
-          const developerNetPrice = Math.max(
-            0,
-            Math.round(task.taskPrice - proportionalFee)
-          );
-
-          return {
-            ...task,
-            price: developerNetPrice,
-            developerNetPrice,
-            columnId: 'todo' as ColumnId,
-          };
-        });
-
-      // 7) Creamos el Project en el modelo (añadirá id, etc.)
-      const project = createProject({
+      const project = await ProjectModel.create({
         ownerEmail,
-        projectTitle: resolvedTitle,
-        projectDescription: resolvedDescription,
         title: resolvedTitle,
         description: resolvedDescription,
-        tasks: tasksWithDeveloperShare,
-        totalHours,
-        totalTasksPrice: grossTotalTasksPrice,
+        tasks,
+        totalTasksPrice,
+        generatorFee: TASK_GENERATOR_FIXED_PRICE_EUR,
         platformFeePercent: PLATFORM_FEE_PERCENT,
-        platformFeeAmount,
-        generatorServiceFee,
-        generatorFee: generatorServiceFee, // alias legacy
-        grandTotalClientCost,
         published: false,
       });
 
-      // 8) Devolvemos el proyecto completo (incluye id y published)
-      return res.status(200).json({
-        project: project as ProjectEstimation & { id: string; published: boolean },
-      });
+      return res.status(200).json({ project: formatProject(project) });
     } catch (error) {
       console.error('Error generando tareas:', error);
       return res
@@ -245,15 +167,19 @@ router.post(
  */
 router.get(
   '/:id',
-  (req: Request<{ id: string }>, res: Response<Project | { error: string }>) => {
+  async (
+    req: Request<{ id: string }>,
+    res: Response<ReturnType<typeof formatProject> | { error: string }>
+  ) => {
     try {
-      const project = getProject(req.params.id);
+      await connectMongo();
+      const project = await ProjectModel.findById(req.params.id);
 
       if (!project) {
         return res.status(404).json({ error: 'Proyecto no encontrado' });
       }
 
-      return res.status(200).json(project);
+      return res.status(200).json(formatProject(project));
     } catch (error) {
       console.error('Error obteniendo proyecto:', error);
       return res
@@ -269,7 +195,7 @@ router.get(
  */
 router.get(
   '/:id/board',
-  (
+  async (
     req: Request<{ id: string }>,
     res: Response<
       | {
@@ -277,16 +203,17 @@ router.get(
           columns: typeof DEFAULT_COLUMNS;
           tasks: Array<
             Pick<
-              GeneratedTask,
-              'id' | 'title' | 'description' | 'price' | 'priority' | 'columnId'
-            > & { layer: TaskCategory }
+              TaskDocument,
+              'title' | 'description' | 'price' | 'priority' | 'columnId'
+            > & { id: string; layer: TaskLayer }
           >;
         }
       | { error: string }
     >
   ) => {
     try {
-      const project = getProject(req.params.id);
+      await connectMongo();
+      const project = await ProjectModel.findById(req.params.id);
 
       if (!project) {
         return res.status(404).json({ error: 'No encontrado' });
@@ -294,18 +221,18 @@ router.get(
 
       return res.status(200).json({
         project: {
-          id: project.id,
-          title: project.projectTitle ?? project.title ?? '',
+          id: project._id.toString(),
+          title: project.title,
           published: project.published,
         },
         columns: DEFAULT_COLUMNS,
         tasks: project.tasks.map((task) => ({
-          id: task.id,
+          id: task._id.toString(),
           title: task.title,
           description: task.description,
-          price: task.price ?? task.taskPrice,
+          price: task.price,
           priority: task.priority,
-          layer: task.layer ?? task.category,
+          layer: task.layer,
           columnId: task.columnId,
         })),
       });
@@ -324,9 +251,9 @@ router.get(
  */
 router.patch(
   '/tasks/:id/move',
-  (
+  async (
     req: Request<{ id: string }, unknown, { columnId?: ColumnId }>,
-    res: Response<GeneratedTask | { error: string }>
+    res: Response<TaskDocument | { error: string }>
   ) => {
     try {
       const { columnId } = req.body || {};
@@ -335,18 +262,23 @@ router.patch(
         return res.status(400).json({ error: 'Columna inválida' });
       }
 
-      const result = findTaskById(req.params.id);
+      await connectMongo();
+      const project = await ProjectModel.findOne({ 'tasks._id': req.params.id });
 
-      if (!result) {
+      if (!project) {
         return res.status(404).json({ error: 'No encontrado' });
       }
 
-      result.task.columnId = columnId;
-      result.project.tasks = result.project.tasks.map((task) =>
-        task.id === result.task.id ? result.task : task
-      );
+      const task = project.tasks.id(req.params.id);
 
-      return res.status(200).json(result.task);
+      if (!task) {
+        return res.status(404).json({ error: 'No encontrado' });
+      }
+
+      task.columnId = columnId;
+      await project.save();
+
+      return res.status(200).json({ ...task.toObject(), id: task._id.toString() });
     } catch (error) {
       console.error('Error moviendo tarea de columna:', error);
       return res
@@ -362,18 +294,23 @@ router.patch(
  */
 router.post(
   '/:id/publish',
-  (
+  async (
     req: Request<{ id: string }>,
-    res: Response<Project | { error: string; explanation?: string }>
+    res: Response<ReturnType<typeof formatProject> | { error: string; explanation?: string }>
   ) => {
     try {
-      const project = publishProject(req.params.id);
+      await connectMongo();
+      const project = await ProjectModel.findById(req.params.id);
 
       if (!project) {
         return res.status(404).json({ error: 'Proyecto no encontrado' });
       }
 
-      return res.status(200).json(project);
+      project.published = true;
+      project.publishedAt = new Date();
+      await project.save();
+
+      return res.status(200).json(formatProject(project));
     } catch (error) {
       console.error('Error publicando proyecto:', error);
       return res
