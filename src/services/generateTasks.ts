@@ -2,10 +2,9 @@
 import { randomUUID } from 'crypto';
 import {
   GeneratedTask,
-  ProjectEstimation,
-  TaskCategory,
-  TaskComplexity,
+  ProjectEstimation
 } from '../models/project';
+import { TaskCategory, TaskComplexity } from '../models/taskTypes';
 import { HOURLY_RATE, PLATFORM_FEE_PERCENT } from '../config/pricing';
 
 interface GenerateTasksInput {

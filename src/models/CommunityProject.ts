@@ -1,12 +1,12 @@
 // src/models/CommunityProject.ts
 import { Schema, model, Document } from 'mongoose';
-import { GeneratedTask } from './project';
+import { TaskDocument } from './Task';
 
 export interface ProjectEstimation {
   projectTitle: string;
   projectDescription: string;
   ownerEmail: string;
-  tasks: GeneratedTask[];
+  tasks: TaskDocument[];
   totalHours: number;
   totalTasksPrice: number;
   platformFeePercent: number;

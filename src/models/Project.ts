@@ -1,6 +1,41 @@
 import { Schema, model, Document } from 'mongoose';
 import { TaskDocument, TaskSchema } from './Task';
+import { TaskCategory, TaskComplexity, ColumnId } from './taskTypes';
 
+
+
+export interface GeneratedTask {
+  id: string;
+  title: string;
+  description: string;
+  category: TaskCategory;
+  complexity: TaskComplexity;
+  priority: number;
+  estimatedHours: number;
+  hourlyRate: number;
+  taskPrice: number;
+
+  // para el board tipo Trello
+  columnId: ColumnId;
+
+  // alias legacy
+  layer?: TaskCategory;
+  price?: number;
+  developerNetPrice?: number;
+}
+
+export interface ProjectEstimation {
+  projectTitle: string;
+  projectDescription: string;
+  ownerEmail: string;
+  tasks: GeneratedTask[];
+  totalHours: number;
+  totalTasksPrice: number;
+  platformFeePercent: number;
+  platformFeeAmount: number;
+  generatorServiceFee: number;
+  grandTotalClientCost: number;
+}
 export interface ProjectDocument extends Document {
   ownerEmail: string;
   title: string;

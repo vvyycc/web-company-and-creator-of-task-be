@@ -2,7 +2,7 @@
 import express, { Request, Response } from 'express';
 import { HOURLY_RATE, PLATFORM_FEE_PERCENT, TASK_GENERATOR_FIXED_PRICE_EUR } from '../config/pricing';
 import { connectMongo } from '../db/mongo';
-import { ProjectModel, ProjectDocument } from '../models/Project';
+import { ProjectModel, ProjectDocument } from '../models/project';
 import { Subscription } from '../models/Subscription';
 import { TaskDocument } from '../models/Task';
 
@@ -269,7 +269,7 @@ router.patch(
         return res.status(404).json({ error: 'No encontrado' });
       }
 
-      const task = project.tasks.id(req.params.id);
+      const task = project.tasks.find((task) => task._id.toString() === req.params.id);
 
       if (!task) {
         return res.status(404).json({ error: 'No encontrado' });
@@ -278,7 +278,7 @@ router.patch(
       task.columnId = columnId;
       await project.save();
 
-      return res.status(200).json({ ...task.toObject(), id: task._id.toString() });
+      return res.status(200).json({ ...task, title: task.title.toString() });
     } catch (error) {
       console.error('Error moviendo tarea de columna:', error);
       return res
