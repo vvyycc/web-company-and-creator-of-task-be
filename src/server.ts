@@ -1,3 +1,4 @@
+import http from 'http';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import express, { Request, Response } from 'express';
@@ -7,10 +8,14 @@ import stripeRouter from './routes/stripe';
 import billingRouter, { billingWebhookHandler } from './routes/billing';
 import communityRouter from './routes/community';
 import { connectMongo } from './db/mongo';
+import { initSocket } from './socket';
 
 dotenv.config();
 
 const app = express();
+const server = http.createServer(app);
+
+export const io = initSocket(server);
 app.use(
   cors({
     origin: process.env.FRONTEND_ORIGIN || 'http://localhost:3000',
@@ -82,7 +87,7 @@ const PORT = Number(process.env.PORT) || 4000;
 async function startServer() {
   try {
     await connectMongo();
-    app.listen(PORT, () => {
+    server.listen(PORT, () => {
       console.log(`Servidor de contacto escuchando en http://localhost:${PORT}`);
     });
   } catch (error) {

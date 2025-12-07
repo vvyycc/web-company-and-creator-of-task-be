@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import {
   GeneratedTask,
   ProjectEstimation
-} from '../models/project';
+} from '../models/Project';
 import { TaskCategory, TaskComplexity } from '../models/taskTypes';
 import { HOURLY_RATE, PLATFORM_FEE_PERCENT } from '../config/pricing';
 
