@@ -5,7 +5,6 @@ import { connectMongo } from '../db/mongo';
 import { ProjectModel, ProjectDocument } from '../models/Project';
 import { Subscription } from '../models/Subscription';
 import { TaskDocument } from '../models/Task';
-import { getIO } from '../socket';
 
 const router = express.Router();
 
@@ -278,19 +277,6 @@ router.patch(
 
       task.columnId = columnId;
       await project.save();
-
-      const updatedTask = {
-        ...('toObject' in task ? (task as unknown as { toObject: () => TaskDocument }).toObject() : task),
-        _id: task._id.toString(),
-      };
-
-      getIO()
-        .to(`project_${project._id}`)
-        .emit('task_updated', {
-          type: 'TASK_UPDATED' as const,
-          projectId: project._id.toString(),
-          task: updatedTask,
-        });
 
       return res.status(200).json({ ...task, title: task.title.toString() });
     } catch (error) {
