@@ -8,6 +8,7 @@ import projectsRouter from "./routes/projects";
 import stripeRouter from "./routes/stripe";
 import billingRouter, { billingWebhookHandler } from "./routes/billing";
 import communityRouter from "./routes/community";
+import verificationRouter from "./routes/verification";
 import { connectMongo } from "./db/mongo";
 import { initSocket } from "./socket";
 
@@ -96,6 +97,7 @@ app.use("/projects", projectsRouter);
 app.use("/stripe", stripeRouter);
 app.use("/billing", billingRouter);
 app.use("/community", communityRouter);
+app.use("/verification", verificationRouter);
 
 const PORT = Number(process.env.PORT) || 4000;
 
