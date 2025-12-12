@@ -8,7 +8,12 @@ export interface TaskDocument {
   price: number;
   layer: 'ARCHITECTURE' | 'MODEL' | 'SERVICE' | 'VIEW';
   columnId: 'todo' | 'doing' | 'done';
+  status: 'TODO' | 'IN_PROGRESS' | 'DONE';
+  assignedToEmail?: string | null;
+  assignedAt?: Date | null;
 }
+
+export type TaskStatus = TaskDocument['status'];
 
 export const TaskSchema = new Schema<TaskDocument>(
   {
@@ -22,6 +27,13 @@ export const TaskSchema = new Schema<TaskDocument>(
       required: true,
     },
     columnId: { type: String, enum: ['todo', 'doing', 'done'], default: 'todo' },
+    status: {
+      type: String,
+      enum: ['TODO', 'IN_PROGRESS', 'DONE'],
+      default: 'TODO',
+    },
+    assignedToEmail: { type: String, default: null },
+    assignedAt: { type: Date, default: null },
   },
   { _id: true }
 );

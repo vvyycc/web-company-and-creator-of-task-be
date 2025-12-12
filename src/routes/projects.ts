@@ -5,6 +5,7 @@ import { connectMongo } from '../db/mongo';
 import { ProjectModel, ProjectDocument } from '../models/Project';
 import { Subscription } from '../models/Subscription';
 import { TaskDocument } from '../models/Task';
+import { emitTaskEvent } from '../services/taskEvents';
 
 const router = express.Router();
 
@@ -32,6 +33,25 @@ export const DEFAULT_COLUMNS: Array<{ id: ColumnId; title: string; order: number
 
 const isValidColumnId = (columnId: string): columnId is ColumnId =>
   DEFAULT_COLUMNS.some((column) => column.id === columnId);
+
+const statusFromColumn: Record<ColumnId, TaskDocument['status']> = {
+  todo: 'TODO',
+  doing: 'IN_PROGRESS',
+  done: 'DONE',
+};
+
+const mapTaskResponse = (task: TaskDocument) => ({
+  id: task._id.toString(),
+  title: task.title,
+  description: task.description,
+  price: task.price,
+  priority: task.priority,
+  layer: task.layer,
+  columnId: task.columnId,
+  status: task.status,
+  assignedToEmail: task.assignedToEmail ?? null,
+  assignedAt: task.assignedAt ?? null,
+});
 
 // --- reglas por categoría para estimar horas ---
 const categoryRules: Record<
@@ -82,6 +102,9 @@ const buildSampleTasks = (
       price,
       layer: template.layer,
       columnId: 'todo' as ColumnId,
+      status: 'TODO',
+      assignedToEmail: null,
+      assignedAt: null,
     };
   });
 };
@@ -226,15 +249,7 @@ router.get(
           published: project.published,
         },
         columns: DEFAULT_COLUMNS,
-        tasks: project.tasks.map((task) => ({
-          id: task._id.toString(),
-          title: task.title,
-          description: task.description,
-          price: task.price,
-          priority: task.priority,
-          layer: task.layer,
-          columnId: task.columnId,
-        })),
+        tasks: project.tasks.map(mapTaskResponse),
       });
     } catch (error) {
       console.error('Error obteniendo tablero de proyecto:', error);
@@ -253,7 +268,7 @@ router.patch(
   '/tasks/:id/move',
   async (
     req: Request<{ id: string }, unknown, { columnId?: ColumnId }>,
-    res: Response<TaskDocument | { error: string }>
+    res: Response<ReturnType<typeof mapTaskResponse> | { error: string }>
   ) => {
     try {
       const { columnId } = req.body || {};
@@ -276,14 +291,85 @@ router.patch(
       }
 
       task.columnId = columnId;
+      task.status = statusFromColumn[columnId];
+
+      if (columnId === 'todo') {
+        task.assignedToEmail = null;
+        task.assignedAt = null;
+      }
+
       await project.save();
 
-      return res.status(200).json({ ...task, title: task.title.toString() });
+      emitTaskEvent(project._id.toString(), 'column_changed', task);
+
+      return res.status(200).json(mapTaskResponse(task));
     } catch (error) {
       console.error('Error moviendo tarea de columna:', error);
       return res
         .status(500)
         .json({ error: 'Error interno al mover la tarea' });
+    }
+  }
+);
+
+/**
+ * POST /projects/tasks/:taskId/claim
+ * Asigna una tarea disponible de forma atómica y la mueve a doing.
+ */
+router.post(
+  '/tasks/:taskId/claim',
+  async (
+    req: Request<{ taskId: string }, unknown, { email?: string }>,
+    res: Response<{ task: ReturnType<typeof mapTaskResponse> } | { error: string }>
+  ) => {
+    try {
+      const { taskId } = req.params;
+      const { email } = req.body || {};
+
+      if (!email) {
+        return res.status(400).json({ error: 'email es obligatorio' });
+      }
+
+      await connectMongo();
+
+      const project = await ProjectModel.findOneAndUpdate(
+        {
+          published: true,
+          'tasks._id': taskId,
+          'tasks.assignedToEmail': null,
+          'tasks.status': 'TODO',
+        },
+        {
+          $set: {
+            'tasks.$.assignedToEmail': email,
+            'tasks.$.assignedAt': new Date(),
+            'tasks.$.status': 'IN_PROGRESS',
+            'tasks.$.columnId': 'doing',
+          },
+        },
+        { new: true }
+      );
+
+      if (!project) {
+        return res
+          .status(409)
+          .json({ error: 'La tarea ya fue asignada por otro usuario' });
+      }
+
+      const task = project.tasks.find((t) => t._id.toString() === taskId);
+
+      if (!task) {
+        return res.status(404).json({ error: 'No encontrado' });
+      }
+
+      emitTaskEvent(project._id.toString(), 'assignment_changed', task);
+
+      return res.status(200).json({ task: mapTaskResponse(task) });
+    } catch (error) {
+      console.error('Error reclamando tarea:', error);
+      return res
+        .status(500)
+        .json({ error: 'Error interno al reclamar la tarea' });
     }
   }
 );
