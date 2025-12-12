@@ -8,9 +8,15 @@ export interface TaskDocument {
   price: number;
   layer: 'ARCHITECTURE' | 'MODEL' | 'SERVICE' | 'VIEW';
   columnId: 'todo' | 'doing' | 'done';
-  status: 'TODO' | 'IN_PROGRESS' | 'DONE';
+  status: 'TODO' | 'IN_PROGRESS' | 'IN_REVIEW' | 'DONE' | 'REJECTED';
   assignedToEmail?: string | null;
   assignedAt?: Date | null;
+  acceptanceCriteria: string;
+  verificationType: 'MANUAL' | 'BACKEND' | 'FRONTEND' | 'WEB3' | 'SOLIDITY';
+  verificationStatus: 'NOT_SUBMITTED' | 'SUBMITTED' | 'APPROVED' | 'REJECTED';
+  verificationNotes: string;
+  verifiedByEmail: string | null;
+  verifiedAt: Date | null;
 }
 
 export type TaskStatus = TaskDocument['status'];
@@ -29,11 +35,25 @@ export const TaskSchema = new Schema<TaskDocument>(
     columnId: { type: String, enum: ['todo', 'doing', 'done'], default: 'todo' },
     status: {
       type: String,
-      enum: ['TODO', 'IN_PROGRESS', 'DONE'],
+      enum: ['TODO', 'IN_PROGRESS', 'IN_REVIEW', 'DONE', 'REJECTED'],
       default: 'TODO',
     },
     assignedToEmail: { type: String, default: null },
     assignedAt: { type: Date, default: null },
+    acceptanceCriteria: { type: String, required: true, default: '' },
+    verificationType: {
+      type: String,
+      enum: ['MANUAL', 'BACKEND', 'FRONTEND', 'WEB3', 'SOLIDITY'],
+      default: 'MANUAL',
+    },
+    verificationStatus: {
+      type: String,
+      enum: ['NOT_SUBMITTED', 'SUBMITTED', 'APPROVED', 'REJECTED'],
+      default: 'NOT_SUBMITTED',
+    },
+    verificationNotes: { type: String, default: '' },
+    verifiedByEmail: { type: String, default: null },
+    verifiedAt: { type: Date, default: null },
   },
   { _id: true }
 );

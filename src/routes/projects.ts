@@ -105,6 +105,12 @@ const buildSampleTasks = (
       status: 'TODO',
       assignedToEmail: null,
       assignedAt: null,
+      acceptanceCriteria: '',
+      verificationType: 'MANUAL',
+      verificationStatus: 'NOT_SUBMITTED',
+      verificationNotes: '',
+      verifiedByEmail: null,
+      verifiedAt: null,
     };
   });
 };
