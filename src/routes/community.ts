@@ -2,7 +2,7 @@ import express, { Request, Response } from 'express';
 import mongoose from 'mongoose';
 import { connectMongo } from '../db/mongo';
 import { CommunityProject } from '../models/CommunityProject';
-
+import { getIO } from '../socket';
 export type ColumnId = 'todo' | 'doing' | 'done';
 
 export type TaskCategory =
@@ -40,6 +40,13 @@ const ensureTaskId = (task: any, fallbackIndex: number) => {
   if (task?.id) return String(task.id);
   // fallback estable (no ideal, pero evita undefined)
   return `task-${fallbackIndex}`;
+};
+const emitBoardUpdate = (projectId: string, tasks: any[]) => {
+  const io = getIO();
+  io.to(`community:${projectId}`).emit('community:boardUpdated', {
+    projectId,
+    tasks: tasks.map((t, idx) => mapTaskToBoard(t, idx)),
+  });
 };
 
 const mapTaskToBoard = (task: any, index = 0): BoardTask => ({
@@ -264,6 +271,7 @@ router.post(
       doc.markModified('estimation');
 
       await doc.save();
+      emitBoardUpdate(id, tasks);
 
       return res.status(200).json({ tasks: tasks.map((t, idx) => mapTaskToBoard(t, idx)) });
     } catch (error) {
@@ -314,6 +322,7 @@ router.post(
       doc.markModified('estimation');
 
       await doc.save();
+      emitBoardUpdate(id, tasks);
 
       return res.status(200).json({ tasks: tasks.map((t, idx) => mapTaskToBoard(t, idx)) });
     } catch (error) {
@@ -363,6 +372,7 @@ router.post(
       doc.markModified('estimation');
 
       await doc.save();
+      emitBoardUpdate(id, tasks);
 
       return res.status(200).json({ tasks: tasks.map((t, idx) => mapTaskToBoard(t, idx)) });
     } catch (error) {
@@ -411,7 +421,7 @@ router.post(
       doc.estimation = estimation;
       doc.markModified('estimation');
       await doc.save();
-
+      emitBoardUpdate(id, tasks);
       return res.status(200).json({ tasks: tasks.map((t, idx) => mapTaskToBoard(t, idx)) });
     } catch (error) {
       console.error('[community] Error reseteando tablero:', error);
