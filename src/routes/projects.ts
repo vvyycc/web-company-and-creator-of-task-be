@@ -6,6 +6,7 @@ import { ProjectModel, ProjectDocument } from '../models/Project';
 import { Subscription } from '../models/Subscription';
 import { TaskDocument } from '../models/Task';
 import { emitTaskEvent } from '../services/taskEvents';
+import mongoose from 'mongoose';
 
 const router = express.Router();
 
@@ -208,6 +209,60 @@ router.get(
       return res
         .status(500)
         .json({ error: 'Error interno al obtener el proyecto' });
+    }
+  }
+);
+
+/**
+ * DELETE /projects/:id
+ * headers: x-user-email
+ * Reglas:
+ * - Solo owner puede borrar (403)
+ * - Si está publicado, no se puede borrar (409)
+ */
+router.delete(
+  "/:id",
+  async (
+    req: Request<{ id: string }>,
+    res: Response<{ message: string } | { error: string }>
+  ) => {
+    try {
+      await connectMongo();
+
+      const { id } = req.params;
+      const userEmail = String(req.headers["x-user-email"] || "").trim();
+
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        return res.status(400).json({ error: "Identificador de proyecto no válido" });
+      }
+
+      if (!userEmail) {
+        return res.status(401).json({ error: "Falta x-user-email" });
+      }
+
+      const project = await ProjectModel.findById(id);
+      if (!project) {
+        return res.status(404).json({ error: "Proyecto no encontrado" });
+      }
+
+      // ✅ solo owner
+      const ownerEmail = String((project as any).ownerEmail || "").toLowerCase();
+      if (ownerEmail && ownerEmail !== userEmail.toLowerCase()) {
+        return res.status(403).json({ error: "forbidden_owner_only" });
+      }
+
+      // ✅ no borrar si publicado
+      const isPublished = Boolean((project as any).isPublished || (project as any).published);
+      if (isPublished) {
+        return res.status(409).json({ error: "project_published_cannot_delete" });
+      }
+
+      await ProjectModel.findByIdAndDelete(id);
+
+      return res.status(200).json({ message: "Proyecto eliminado correctamente" });
+    } catch (error) {
+      console.error("Error eliminando proyecto:", error);
+      return res.status(500).json({ error: "Error interno al eliminar el proyecto" });
     }
   }
 );
