@@ -9,6 +9,9 @@ import { emitTaskEvent } from '../services/taskEvents';
 
 const router = express.Router();
 
+const extractUserEmail = (req: Request) =>
+  req.header('x-user-email') || req.header('X-User-Email');
+
 type ColumnId = TaskDocument['columnId'];
 type TaskLayer = TaskDocument['layer'];
 
@@ -402,6 +405,51 @@ router.post(
       return res
         .status(500)
         .json({ error: 'Error interno al publicar el proyecto' });
+    }
+  }
+);
+
+router.delete(
+  '/:id',
+  async (
+    req: Request<{ id: string }, unknown, unknown, { force?: string }>,
+    res: Response<{ success: true; deletedProjectId: string } | { error: string }>
+  ) => {
+    try {
+      const userEmail = extractUserEmail(req);
+
+      if (!userEmail) {
+        return res.status(400).json({ error: 'Falta header x-user-email' });
+      }
+
+      await connectMongo();
+
+      const project = await ProjectModel.findById(req.params.id);
+
+      if (!project) {
+        return res.status(404).json({ error: 'Proyecto no encontrado' });
+      }
+
+      if (project.ownerEmail !== userEmail) {
+        return res.status(403).json({ error: 'No autorizado' });
+      }
+
+      if (project.published && req.query.force !== 'true') {
+        return res.status(409).json({
+          error: 'Proyecto publicado. Despublica o usa force=true',
+        });
+      }
+
+      await project.deleteOne();
+
+      return res
+        .status(200)
+        .json({ success: true, deletedProjectId: project._id.toString() });
+    } catch (error) {
+      console.error('Error eliminando proyecto:', error);
+      return res
+        .status(500)
+        .json({ error: 'Error interno al eliminar el proyecto' });
     }
   }
 );
