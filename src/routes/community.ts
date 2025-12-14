@@ -7,12 +7,12 @@ import { getIO } from '../socket';
 export type ColumnId = 'todo' | 'doing' | 'done';
 
 export type TaskCategory =
-  | 'ARCHITECTURE'
-  | 'MODEL'
-  | 'SERVICE'
-  | 'VIEW'
-  | 'INFRA'
-  | 'QA';
+  | "ARCHITECTURE"
+  | "MODEL"
+  | "SERVICE"
+  | "VIEW"
+  | "INFRA"
+  | "QA";
 
 export interface BoardTask {
   id: string;
@@ -37,42 +37,83 @@ const formatProject = (project: ProjectDocument) => ({
 });
 
 const BOARD_COLUMNS: Array<{ id: ColumnId; title: string; order: number }> = [
-  { id: 'todo', title: 'Por hacer', order: 1 },
-  { id: 'doing', title: 'Haciendo', order: 2 },
-  { id: 'done', title: 'Hecho', order: 3 },
+  { id: "todo", title: "Por hacer", order: 1 },
+  { id: "doing", title: "Haciendo", order: 2 },
+  { id: "done", title: "Hecho", order: 3 },
 ];
 
 const MAX_DOING_PER_USER = 2;
 
-// ⚠️ clave: tus tareas usan "id" (no taskId). Si no existe, generamos uno estable.
-const ensureTaskId = (task: any, fallbackIndex: number) => {
-  if (task?.id) return String(task.id);
-  // fallback estable (no ideal, pero evita undefined)
-  return `task-${fallbackIndex}`;
-};
-const emitBoardUpdate = (projectId: string, tasks: any[]) => {
-  const io = getIO();
-  io.to(`community:${projectId}`).emit('community:boardUpdated', {
-    projectId,
-    tasks: tasks.map((t, idx) => mapTaskToBoard(t, idx)),
-  });
+// ✅ IDs reales persistentes (no task-0)
+const ensurePersistentTaskId = (task: any) => {
+  const existing = task?.id ?? task?.taskId ?? task?._id;
+  if (existing) return String(existing);
+  return new mongoose.Types.ObjectId().toString();
 };
 
-const mapTaskToBoard = (task: any, index = 0): BoardTask => ({
-  id: ensureTaskId(task, index),
+const mapTaskToBoard = (task: any): BoardTask => ({
+  id: String(task.id),
   title: task.title,
   description: task.description,
   price: task.taskPrice ?? task.price ?? 0,
   priority: task.priority ?? 0,
-  layer: (task.layer ?? task.category ?? 'SERVICE') as TaskCategory,
-  columnId: (task.columnId as ColumnId) ?? 'todo',
+  layer: (task.layer ?? task.category ?? "SERVICE") as TaskCategory,
+  columnId: (task.columnId as ColumnId) ?? "todo",
   assigneeEmail: task.assigneeEmail ?? null,
   assigneeAvatar: task.assigneeAvatar ?? null,
 });
 
+const normalizePlatformFeePercent = (estimation: any) => {
+  const raw = estimation?.platformFeePercent;
+  const pf =
+    typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : 1;
+  estimation.platformFeePercent = pf;
+  return pf;
+};
+
+const normalizeEstimationTasks = (estimation: any) => {
+  const tasks: any[] = Array.isArray(estimation?.tasks) ? estimation.tasks : [];
+  const normalized = tasks.map((t) => ({
+    ...t,
+    id: ensurePersistentTaskId(t),
+    columnId: (t.columnId as ColumnId) ?? "todo",
+    assigneeEmail: t.assigneeEmail ?? null,
+    assigneeAvatar: t.assigneeAvatar ?? null,
+  }));
+  estimation.tasks = normalized;
+  return normalized;
+};
+
+const computeTotals = (estimation: any) => {
+  const tasks: any[] = Array.isArray(estimation?.tasks) ? estimation.tasks : [];
+
+  const totalTasksPrice =
+    typeof estimation?.totalTasksPrice === "number" && estimation.totalTasksPrice > 0
+      ? estimation.totalTasksPrice
+      : tasks.reduce((sum, t) => sum + (t.taskPrice ?? t.price ?? 0), 0);
+
+  const platformFeePercent = normalizePlatformFeePercent(estimation);
+  const platformFeeAmount = +((totalTasksPrice * platformFeePercent) / 100).toFixed(2);
+  const totalClientPrice = +(totalTasksPrice + platformFeeAmount).toFixed(2);
+
+  estimation.totalTasksPrice = totalTasksPrice;
+  estimation.platformFeeAmount = platformFeeAmount;
+  estimation.totalClientPrice = totalClientPrice;
+
+  return { totalTasksPrice, platformFeePercent, platformFeeAmount, totalClientPrice };
+};
+
+const emitBoardUpdate = (projectId: string, tasks: any[]) => {
+  const io = getIO();
+  io.to(`community:${projectId}`).emit("community:boardUpdated", {
+    projectId,
+    tasks: tasks.map(mapTaskToBoard),
+  });
+};
+
 // ----------------- POST publish -----------------
 router.post(
-  '/projects',
+  "/projects",
   async (
     req: Request<
       unknown,
@@ -93,21 +134,15 @@ router.post(
       if (!ownerEmail || !projectTitle || !projectDescription || !estimation) {
         return res.status(400).json({
           error:
-            'ownerEmail, projectTitle, projectDescription y estimation son obligatorios',
+            "ownerEmail, projectTitle, projectDescription y estimation son obligatorios",
         });
       }
 
       await connectMongo();
 
-      // ✅ asegúrate de que cada task tenga id y columnId inicial
-      const tasks: any[] = Array.isArray(estimation?.tasks) ? estimation.tasks : [];
-      estimation.tasks = tasks.map((t, idx) => ({
-        ...t,
-        id: ensureTaskId(t, idx),
-        columnId: (t.columnId as ColumnId) ?? 'todo',
-        assigneeEmail: t.assigneeEmail ?? null,
-        assigneeAvatar: t.assigneeAvatar ?? null,
-      }));
+      // ✅ normaliza tasks + calcula totales + fija 1% mínimo
+      normalizeEstimationTasks(estimation);
+      computeTotals(estimation);
 
       const doc = await CommunityProject.create({
         ownerEmail,
@@ -122,10 +157,10 @@ router.post(
 
       return res.status(200).json({ id, publicUrl });
     } catch (error) {
-      console.error('[community] Error creando proyecto de comunidad:', error);
+      console.error("[community] Error creando proyecto de comunidad:", error);
       return res
         .status(500)
-        .json({ error: 'Error interno creando proyecto de comunidad' });
+        .json({ error: "Error interno creando proyecto de comunidad" });
     }
   }
 );
@@ -176,41 +211,46 @@ router.post(
 
 // ----------------- GET board -----------------
 router.get(
-  '/projects/:id/board',
-  async (
-    req: Request<{ id: string }>,
-    res: Response<
-      | {
-          project: {
-            id: string;
-            title: string;
-            description: string;
-            ownerEmail: string;
-            published: boolean;
-          };
-          columns: typeof BOARD_COLUMNS;
-          tasks: BoardTask[];
-        }
-      | { error: string }
-    >
-  ) => {
+  "/projects/:id/board",
+  async (req: Request<{ id: string }>, res: Response) => {
     try {
       await connectMongo();
       const { id } = req.params;
 
       if (!mongoose.Types.ObjectId.isValid(id)) {
-        return res.status(400).json({ error: 'Identificador de proyecto no válido' });
+        return res
+          .status(400)
+          .json({ error: "Identificador de proyecto no válido" });
       }
 
       const doc = await CommunityProject.findById(id).lean();
       if (!doc || !doc.isPublished) {
-        return res.status(404).json({ error: 'Proyecto de comunidad no encontrado' });
+        return res
+          .status(404)
+          .json({ error: "Proyecto de comunidad no encontrado" });
       }
 
-      const estimation = doc.estimation as any;
-      const rawTasks: any[] = Array.isArray(estimation?.tasks) ? estimation.tasks : [];
+      const estimation = (doc.estimation as any) || {};
+      const tasksRaw: any[] = Array.isArray(estimation?.tasks)
+        ? estimation.tasks
+        : [];
 
-      const tasks = rawTasks.map((t, idx) => mapTaskToBoard(t, idx));
+      const totalTasksPrice =
+        estimation?.totalTasksPrice ??
+        tasksRaw.reduce((sum, t) => sum + (t.taskPrice ?? t.price ?? 0), 0);
+
+      const platformFeePercent =
+        typeof estimation?.platformFeePercent === "number" &&
+        estimation.platformFeePercent > 0
+          ? estimation.platformFeePercent
+          : 1;
+
+      const platformFeeAmount = +(
+        (totalTasksPrice * platformFeePercent) /
+        100
+      ).toFixed(2);
+
+      const totalClientPrice = +(totalTasksPrice + platformFeeAmount).toFixed(2);
 
       return res.status(200).json({
         project: {
@@ -221,28 +261,49 @@ router.get(
           published: doc.isPublished,
         },
         columns: BOARD_COLUMNS,
-        tasks,
+        tasks: tasksRaw.map(mapTaskToBoard),
+        totalTasksPrice,
+        platformFeePercent,
+        platformFeeAmount,
+        totalClientPrice,
       });
     } catch (error) {
-      console.error('[community] Error obteniendo tablero de comunidad:', error);
-      return res.status(500).json({ error: 'Error interno obteniendo tablero de comunidad' });
+      console.error("[community] Error obteniendo tablero de comunidad:", error);
+      return res
+        .status(500)
+        .json({ error: "Error interno obteniendo tablero de comunidad" });
     }
   }
 );
 
 // ----------------- GET list -----------------
-router.get('/projects', async (_req: Request, res: Response) => {
+router.get("/projects", async (_req: Request, res: Response) => {
   try {
     await connectMongo();
     const docs = await CommunityProject.find({ isPublished: true }).lean();
 
     const list = docs.map((doc) => {
-      const estimation = doc.estimation as any;
-      const tasksRaw: any[] = Array.isArray(estimation?.tasks) ? estimation.tasks : [];
+      const estimation = (doc.estimation as any) || {};
+      const tasksRaw: any[] = Array.isArray(estimation?.tasks)
+        ? estimation.tasks
+        : [];
 
       const totalTasksPrice =
         estimation?.totalTasksPrice ??
         tasksRaw.reduce((sum, t) => sum + (t.taskPrice ?? t.price ?? 0), 0);
+
+      const platformFeePercent =
+        typeof estimation?.platformFeePercent === "number" &&
+        estimation.platformFeePercent > 0
+          ? estimation.platformFeePercent
+          : 1;
+
+      const platformFeeAmount = +(
+        (totalTasksPrice * platformFeePercent) /
+        100
+      ).toFixed(2);
+
+      const totalClientPrice = +(totalTasksPrice + platformFeeAmount).toFixed(2);
 
       return {
         id: String(doc._id),
@@ -250,7 +311,9 @@ router.get('/projects', async (_req: Request, res: Response) => {
         description: doc.projectDescription,
         ownerEmail: doc.ownerEmail,
         totalTasksPrice,
-        platformFeePercent: estimation?.platformFeePercent ?? 1,
+        platformFeePercent,
+        platformFeeAmount,
+        totalClientPrice,
         tasksCount: tasksRaw.length,
         publishedAt: doc.createdAt ?? doc.updatedAt,
       };
@@ -258,227 +321,73 @@ router.get('/projects', async (_req: Request, res: Response) => {
 
     return res.status(200).json(list);
   } catch (error) {
-    console.error('[community] Error listando proyectos de comunidad:', error);
-    return res.status(500).json({ error: 'Error interno listando proyectos de comunidad' });
+    console.error("[community] Error listando proyectos de comunidad:", error);
+    return res
+      .status(500)
+      .json({ error: "Error interno listando proyectos de comunidad" });
   }
 });
 
-// ----------------- ASSIGN (todo -> doing) -----------------
+// ----------------- ASSIGN -----------------
 router.post(
-  '/projects/:id/tasks/:taskId/assign',
+  "/projects/:id/tasks/:taskId/assign",
   async (
     req: Request<
       { id: string; taskId: string },
       unknown,
       { userEmail?: string; userAvatar?: string }
     >,
-    res: Response<{ tasks: BoardTask[] } | { error: string }>
+    res: Response
   ) => {
     try {
       const { id, taskId } = req.params;
       const { userEmail, userAvatar } = req.body || {};
 
-      if (!userEmail) return res.status(400).json({ error: 'userEmail es obligatorio' });
+      if (!userEmail) return res.status(400).json({ error: "userEmail es obligatorio" });
 
       await connectMongo();
       const doc = await CommunityProject.findById(id);
-      if (!doc || !doc.isPublished) return res.status(404).json({ error: 'Proyecto no encontrado' });
+      if (!doc || !doc.isPublished) return res.status(404).json({ error: "Proyecto no encontrado" });
 
       if (doc.ownerEmail === userEmail) {
-        return res.status(403).json({ error: 'El creador del proyecto no puede tomar tareas' });
+        return res.status(403).json({ error: "El creador del proyecto no puede tomar tareas" });
       }
 
       const estimation: any = doc.estimation || {};
-      const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
+      const tasks = normalizeEstimationTasks(estimation);
 
-      // límite: 2 doing
       const doingCount = tasks.filter(
-        (t) => t.assigneeEmail === userEmail && (t.columnId ?? 'todo') === 'doing'
+        (t) => t.assigneeEmail === userEmail && (t.columnId ?? "todo") === "doing"
       ).length;
       if (doingCount >= MAX_DOING_PER_USER) {
-        return res.status(400).json({ error: 'max_doing_reached' });
+        return res.status(400).json({ error: "max_doing_reached" });
       }
 
       const task = tasks.find((t) => String(t.id) === String(taskId));
-      if (!task) return res.status(404).json({ error: 'Tarea no encontrada' });
+      if (!task) return res.status(404).json({ error: "Tarea no encontrada" });
 
-      const currentColumn = (task.columnId ?? 'todo') as ColumnId;
-
-      // solo todo -> doing
-      if (currentColumn !== 'todo') {
+      if ((task.columnId ?? "todo") !== "todo") {
         return res.status(400).json({ error: 'Solo se pueden asignar tareas en "Por hacer"' });
       }
 
       if (task.assigneeEmail && task.assigneeEmail !== userEmail) {
-        return res.status(409).json({ error: 'task_already_assigned' });
+        return res.status(409).json({ error: "task_already_assigned" });
       }
 
       task.assigneeEmail = userEmail;
       task.assigneeAvatar = userAvatar ?? task.assigneeAvatar ?? null;
-      task.columnId = 'doing';
+      task.columnId = "doing";
 
       estimation.tasks = tasks;
       doc.estimation = estimation;
-
-      // ✅ CLAVE: forzar a mongoose a persistir cambios en Mixed/anidados
-      doc.markModified('estimation');
-
+      doc.markModified("estimation");
       await doc.save();
+
       emitBoardUpdate(id, tasks);
-
-      return res.status(200).json({ tasks: tasks.map((t, idx) => mapTaskToBoard(t, idx)) });
+      return res.status(200).json({ tasks: tasks.map(mapTaskToBoard) });
     } catch (error) {
-      console.error('[community] Error asignando tarea:', error);
-      return res.status(500).json({ error: 'Error interno asignando tarea' });
-    }
-  }
-);
-
-// ----------------- UNASSIGN (doing -> todo) -----------------
-router.post(
-  '/projects/:id/tasks/:taskId/unassign',
-  async (
-    req: Request<{ id: string; taskId: string }, unknown, { userEmail?: string }>,
-    res: Response<{ tasks: BoardTask[] } | { error: string }>
-  ) => {
-    try {
-      const { id, taskId } = req.params;
-      const { userEmail } = req.body || {};
-      if (!userEmail) return res.status(400).json({ error: 'userEmail es obligatorio' });
-
-      await connectMongo();
-      const doc = await CommunityProject.findById(id);
-      if (!doc || !doc.isPublished) return res.status(404).json({ error: 'Proyecto no encontrado' });
-
-      const estimation: any = doc.estimation || {};
-      const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
-
-      const task = tasks.find((t) => String(t.id) === String(taskId));
-      if (!task) return res.status(404).json({ error: 'Tarea no encontrada' });
-
-      if (task.assigneeEmail !== userEmail) {
-        return res.status(403).json({ error: 'No eres el asignado a esta tarea' });
-      }
-
-      if ((task.columnId ?? 'todo') !== 'doing') {
-        return res.status(400).json({ error: 'Solo se pueden desasignar tareas en "Haciendo"' });
-      }
-
-      task.assigneeEmail = null;
-      task.assigneeAvatar = null;
-      task.columnId = 'todo';
-
-      estimation.tasks = tasks;
-      doc.estimation = estimation;
-
-      // ✅ CLAVE
-      doc.markModified('estimation');
-
-      await doc.save();
-      emitBoardUpdate(id, tasks);
-
-      return res.status(200).json({ tasks: tasks.map((t, idx) => mapTaskToBoard(t, idx)) });
-    } catch (error) {
-      console.error('[community] Error desasignando tarea:', error);
-      return res.status(500).json({ error: 'Error interno desasignando tarea' });
-    }
-  }
-);
-
-// ----------------- COMPLETE (doing -> done) -----------------
-router.post(
-  '/projects/:id/tasks/:taskId/complete',
-  async (
-    req: Request<{ id: string; taskId: string }, unknown, { userEmail?: string }>,
-    res: Response<{ tasks: BoardTask[] } | { error: string }>
-  ) => {
-    try {
-      const { id, taskId } = req.params;
-      const { userEmail } = req.body || {};
-      if (!userEmail) return res.status(400).json({ error: 'userEmail es obligatorio' });
-
-      await connectMongo();
-      const doc = await CommunityProject.findById(id);
-      if (!doc || !doc.isPublished) return res.status(404).json({ error: 'Proyecto no encontrado' });
-
-      const estimation: any = doc.estimation || {};
-      const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
-
-      const task = tasks.find((t) => String(t.id) === String(taskId));
-      if (!task) return res.status(404).json({ error: 'Tarea no encontrada' });
-
-      if (task.assigneeEmail !== userEmail) {
-        return res.status(403).json({ error: 'Solo el asignado puede completarla' });
-      }
-
-      if ((task.columnId ?? 'todo') !== 'doing') {
-        return res.status(400).json({ error: 'Solo se pueden completar tareas en "Haciendo"' });
-      }
-
-      task.columnId = 'done';
-      // ✅ mantenemos assigneeEmail/assigneeAvatar para saber quién la hizo
-
-      estimation.tasks = tasks;
-      doc.estimation = estimation;
-
-      // ✅ CLAVE
-      doc.markModified('estimation');
-
-      await doc.save();
-      emitBoardUpdate(id, tasks);
-
-      return res.status(200).json({ tasks: tasks.map((t, idx) => mapTaskToBoard(t, idx)) });
-    } catch (error) {
-      console.error('[community] Error completando tarea:', error);
-      return res.status(500).json({ error: 'Error interno completando tarea' });
-    }
-  }
-);
-
-/**
- * (OPCIONAL) RESET de estados para un proyecto:
- * POST /community/projects/:id/reset-board
- * body: { ownerEmail }
- * pone todo en "todo" y limpia assignee*
- */
-router.post(
-  '/projects/:id/reset-board',
-  async (
-    req: Request<{ id: string }, unknown, { ownerEmail?: string }>,
-    res: Response<{ tasks: BoardTask[] } | { error: string }>
-  ) => {
-    try {
-      const { id } = req.params;
-      const { ownerEmail } = req.body || {};
-
-      if (!ownerEmail) return res.status(400).json({ error: 'ownerEmail es obligatorio' });
-
-      await connectMongo();
-      const doc = await CommunityProject.findById(id);
-      if (!doc || !doc.isPublished) return res.status(404).json({ error: 'Proyecto no encontrado' });
-
-      if (doc.ownerEmail !== ownerEmail) {
-        return res.status(403).json({ error: 'Solo el owner puede resetear el tablero' });
-      }
-
-      const estimation: any = doc.estimation || {};
-      const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
-
-      for (const t of tasks) {
-        t.columnId = 'todo';
-        t.assigneeEmail = null;
-        t.assigneeAvatar = null;
-      }
-
-      estimation.tasks = tasks;
-      doc.estimation = estimation;
-      doc.markModified('estimation');
-      await doc.save();
-      emitBoardUpdate(id, tasks);
-      return res.status(200).json({ tasks: tasks.map((t, idx) => mapTaskToBoard(t, idx)) });
-    } catch (error) {
-      console.error('[community] Error reseteando tablero:', error);
-      return res.status(500).json({ error: 'Error interno reseteando tablero' });
+      console.error("[community] Error asignando tarea:", error);
+      return res.status(500).json({ error: "Error interno asignando tarea" });
     }
   }
 );

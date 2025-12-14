@@ -9,10 +9,11 @@ export function initSocket(server: http.Server) {
     process.env.FRONTEND_ORIGIN || "http://localhost:3000";
 
   ioInstance = new SocketIOServer(server, {
+    path: "/socket.io",
     cors: {
       origin: FRONTEND_ORIGIN,
       credentials: true,
-      methods: ["GET", "POST"],
+      methods: ["GET", "POST", "OPTIONS"],
     },
   });
 
@@ -43,7 +44,9 @@ export function initSocket(server: http.Server) {
 
 export function getIO() {
   if (!ioInstance) {
-    throw new Error("Socket.IO no inicializado. Llama a initSocket(server) primero.");
+    throw new Error(
+      "Socket.IO no inicializado. Llama a initSocket(server) primero."
+    );
   }
   return ioInstance;
 }

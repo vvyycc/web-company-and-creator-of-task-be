@@ -16,8 +16,8 @@ dotenv.config();
 const app = express();
 const server = http.createServer(app);
 
-// ✅ Socket.IO (exportado para usarlo desde routes/community.ts)
-export const io = initSocket(server);
+// ✅ Socket.IO
+initSocket(server);
 
 const FRONTEND_ORIGIN =
   process.env.FRONTEND_ORIGIN || "http://localhost:3000";
