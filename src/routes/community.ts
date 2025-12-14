@@ -2,6 +2,7 @@ import express, { Request, Response } from 'express';
 import mongoose from 'mongoose';
 import { connectMongo } from '../db/mongo';
 import { CommunityProject } from '../models/CommunityProject';
+import { ProjectModel, ProjectDocument } from '../models/Project';
 import { getIO } from '../socket';
 export type ColumnId = 'todo' | 'doing' | 'done';
 
@@ -26,6 +27,14 @@ export interface BoardTask {
 }
 
 const router = express.Router();
+
+const extractUserEmail = (req: Request) =>
+  req.header('x-user-email') || req.header('X-User-Email');
+
+const formatProject = (project: ProjectDocument) => ({
+  ...project.toObject(),
+  id: project._id.toString(),
+});
 
 const BOARD_COLUMNS: Array<{ id: ColumnId; title: string; order: number }> = [
   { id: 'todo', title: 'Por hacer', order: 1 },
@@ -117,6 +126,50 @@ router.post(
       return res
         .status(500)
         .json({ error: 'Error interno creando proyecto de comunidad' });
+    }
+  }
+);
+
+router.post(
+  '/projects/:id/unpublish',
+  async (
+    req: Request<{ id: string }>,
+    res: Response<{ project: ReturnType<typeof formatProject> } | { error: string }>
+  ) => {
+    try {
+      const userEmail = extractUserEmail(req);
+
+      if (!userEmail) {
+        return res.status(400).json({ error: 'Falta header x-user-email' });
+      }
+
+      const { id } = req.params;
+
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        return res.status(400).json({ error: 'Identificador de proyecto no válido' });
+      }
+
+      await connectMongo();
+      const project = await ProjectModel.findById(id);
+
+      if (!project) {
+        return res.status(404).json({ error: 'Proyecto no encontrado' });
+      }
+
+      if (project.ownerEmail !== userEmail) {
+        return res.status(403).json({ error: 'No autorizado' });
+      }
+
+      project.published = false;
+      project.publishedAt = undefined;
+      await project.save();
+
+      return res.status(200).json({ project: formatProject(project) });
+    } catch (error) {
+      console.error('[community] Error despublicando proyecto:', error);
+      return res
+        .status(500)
+        .json({ error: 'Error interno al despublicar el proyecto' });
     }
   }
 );
