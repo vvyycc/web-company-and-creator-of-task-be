@@ -213,6 +213,36 @@ router.get(
 );
 
 /**
+ * DELETE /projects/:id
+ * Elimina un proyecto existente.
+ */
+router.delete(
+  '/:id',
+  async (
+    req: Request<{ id: string }>,
+    res: Response<{ message: string } | { error: string }>
+  ) => {
+    try {
+      await connectMongo();
+      const project = await ProjectModel.findByIdAndDelete(req.params.id);
+
+      if (!project) {
+        return res.status(404).json({ error: 'Proyecto no encontrado' });
+      }
+
+      return res
+        .status(200)
+        .json({ message: 'Proyecto eliminado correctamente' });
+    } catch (error) {
+      console.error('Error eliminando proyecto:', error);
+      return res
+        .status(500)
+        .json({ error: 'Error interno al eliminar el proyecto' });
+    }
+  }
+);
+
+/**
  * GET /projects/:id/board
  * Devuelve datos adaptados al tablero (columns + tasks con columnId)
  */
