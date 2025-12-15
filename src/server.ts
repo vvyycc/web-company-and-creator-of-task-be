@@ -8,7 +8,6 @@ import projectsRouter from "./routes/projects";
 import stripeRouter from "./routes/stripe";
 import billingRouter, { billingWebhookHandler } from "./routes/billing";
 import communityRouter from "./routes/community";
-import verificationRouter from "./routes/verification";
 import { connectMongo } from "./db/mongo";
 import { initSocket } from "./socket";
 
@@ -17,40 +16,27 @@ dotenv.config();
 const app = express();
 const server = http.createServer(app);
 
-// ✅ Socket.IO (exportado para usarlo desde routes/community.ts)
 export const io = initSocket(server);
 
 const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "http://localhost:3000";
 
-// ✅ CORS HTTP (IMPORTANTE: permitir x-user-email)
+// ✅ CORS HTTP (IMPORTANTE: añadir x-user-email)
 app.use(
   cors({
     origin: FRONTEND_ORIGIN,
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "x-user-email"], // ✅ FIX
+    allowedHeaders: ["Content-Type", "Authorization", "x-user-email"],
   })
 );
+app.options("*", cors({ origin: FRONTEND_ORIGIN, credentials: true }));
 
-// ✅ Preflight global
-app.options(
-  "*",
-  cors({
-    origin: FRONTEND_ORIGIN,
-    credentials: true,
-    allowedHeaders: ["Content-Type", "Authorization", "x-user-email"], // ✅ FIX
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  })
-);
-
-// Stripe webhook necesita raw body
 app.post(
   "/billing/webhook",
   express.raw({ type: "application/json" }),
   billingWebhookHandler
 );
 
-// JSON para el resto
 app.use(express.json());
 
 const EMAIL_REGEX = /^[\w.+-]+@[\w-]+\.[\w.-]+$/i;
@@ -72,7 +58,8 @@ app.post(
     if (!email || !email.trim()) errors.email = "El email es obligatorio.";
     else if (!EMAIL_REGEX.test(email))
       errors.email = "El formato del email no es válido.";
-    if (!message || !message.trim()) errors.message = "El mensaje es obligatorio.";
+    if (!message || !message.trim())
+      errors.message = "El mensaje es obligatorio.";
 
     if (Object.keys(errors).length > 0) return res.status(400).json({ errors });
 
@@ -102,7 +89,6 @@ app.use("/projects", projectsRouter);
 app.use("/stripe", stripeRouter);
 app.use("/billing", billingRouter);
 app.use("/community", communityRouter);
-app.use("/verification", verificationRouter);
 
 const PORT = Number(process.env.PORT) || 4000;
 
