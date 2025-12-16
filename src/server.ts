@@ -8,6 +8,8 @@ import projectsRouter from "./routes/projects";
 import stripeRouter from "./routes/stripe";
 import billingRouter, { billingWebhookHandler } from "./routes/billing";
 import communityRouter from "./routes/community";
+import integrationsGithubRouter from "./routes/integrationsGithub";
+import githubWebhookRouter from "./routes/githubWebhook";
 import { connectMongo } from "./db/mongo";
 import { initSocket } from "./socket";
 
@@ -35,6 +37,12 @@ app.post(
   "/billing/webhook",
   express.raw({ type: "application/json" }),
   billingWebhookHandler
+);
+
+app.use(
+  "/webhooks/github",
+  express.raw({ type: "application/json" }),
+  githubWebhookRouter
 );
 
 app.use(express.json());
@@ -88,6 +96,7 @@ app.post(
 app.use("/projects", projectsRouter);
 app.use("/stripe", stripeRouter);
 app.use("/billing", billingRouter);
+app.use("/integrations/github", integrationsGithubRouter);
 app.use("/community", communityRouter);
 
 const PORT = Number(process.env.PORT) || 4000;

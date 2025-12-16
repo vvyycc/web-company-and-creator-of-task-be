@@ -27,6 +27,25 @@ export type VerificationStatus =
   | "APPROVED"
   | "REJECTED";
 
+export type RepoCheckStatus = "IDLE" | "PENDING" | "PASSED" | "FAILED";
+
+export type TaskRepo = {
+  provider?: "github";
+  repoFullName?: string;
+  prNumber?: number;
+  branch?: string;
+  checks?: {
+    status?: RepoCheckStatus;
+    lastRunUrl?: string;
+    lastRunConclusion?: string | null;
+  };
+};
+
+export type TaskVerification = {
+  status: VerificationStatus;
+  notes?: string;
+};
+
 export interface BoardTask {
   id: string;
   title: string;
@@ -40,6 +59,8 @@ export interface BoardTask {
 
   status?: TaskStatus;
   verificationStatus?: VerificationStatus;
+  verification?: TaskVerification;
+  repo?: TaskRepo | null;
   acceptanceCriteria?: string;
   verificationNotes?: string;
 }
@@ -63,10 +84,54 @@ function isValidObjectIdString(v: unknown) {
  * ✅ MIGRACIÓN EN CALIENTE:
  * Si hay tareas legacy con id tipo "task-0", vacío o duplicado,
  * les asignamos un ObjectId REAL y lo guardamos en Mongo.
- *
- * Esto arregla el 404 de /assign en proyectos antiguos.
+ * Además, inicializamos los campos nuevos de verificación/repositorio
+ * para no romper el front.
  */
-async function normalizeAndPersistTaskIds(doc: any): Promise<void> {
+export function ensureTaskDefaults(task: any): boolean {
+  let changed = false;
+
+  if (!task) return changed;
+
+  if (!task.columnId) {
+    task.columnId = "todo";
+    changed = true;
+  }
+
+  if (!task.verificationStatus) {
+    task.verificationStatus = "NOT_SUBMITTED";
+    changed = true;
+  }
+
+  if (!task.verification) {
+    task.verification = { status: task.verificationStatus };
+    changed = true;
+  } else if (!task.verification.status) {
+    task.verification.status = task.verificationStatus;
+    changed = true;
+  }
+
+  if (!task.repo) {
+    task.repo = null;
+  }
+
+  if (task.repo) {
+    if (!task.repo.checks) {
+      task.repo.checks = { status: "IDLE" };
+      changed = true;
+    } else if (!task.repo.checks.status) {
+      task.repo.checks.status = "IDLE";
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
+/**
+ * ✅ MIGRACIÓN EN CALIENTE:
+ * Normaliza ids y defaults de tareas y persiste si cambió algo.
+ */
+export async function normalizeAndPersistTaskIds(doc: any): Promise<void> {
   const estimation: any = doc.estimation || {};
   const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
 
@@ -91,7 +156,7 @@ async function normalizeAndPersistTaskIds(doc: any): Promise<void> {
       used.add(s);
     }
 
-    if (!t.columnId) t.columnId = "todo";
+    if (ensureTaskDefaults(t)) changed = true;
   }
 
   if (changed) {
@@ -102,7 +167,9 @@ async function normalizeAndPersistTaskIds(doc: any): Promise<void> {
   }
 }
 
-const mapTaskToBoard = (task: any): BoardTask => {
+export const mapTaskToBoard = (task: any): BoardTask => {
+  ensureTaskDefaults(task);
+
   const id = String(task.id);
   const columnId = ((task.columnId as ColumnId) ?? "todo") as ColumnId;
 
@@ -119,12 +186,14 @@ const mapTaskToBoard = (task: any): BoardTask => {
 
     status: task.status as TaskStatus | undefined,
     verificationStatus: task.verificationStatus as VerificationStatus | undefined,
+    verification: task.verification,
+    repo: task.repo ?? null,
     acceptanceCriteria: task.acceptanceCriteria ?? task.acceptance ?? undefined,
     verificationNotes: task.verificationNotes ?? "",
   };
 };
 
-const emitBoardUpdate = (projectId: string, tasks: any[]) => {
+export const emitBoardUpdate = (projectId: string, tasks: any[]) => {
   const io = getIO();
   io.to(`community:${projectId}`).emit("community:boardUpdated", {
     projectId,
