@@ -18,8 +18,21 @@ const router = express.Router();
 
 const GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize";
 
+/**
+ * ✅ RUTAS FINALES (si montas app.use("/integrations", router)):
+ * - GET  /integrations/github/login?userEmail=...
+ * - GET  /integrations/github/callback?code=...&state=...
+ * - POST /integrations/community/projects/:id/tasks/:taskId/link-repo
+ * - POST /integrations/community/projects/:id/tasks/:taskId/run-verify
+ */
+
+// -------------------------
+// GET /github/login
+// -------------------------
 router.get("/login", async (req: Request, res: Response) => {
   const userEmail = (req.query.userEmail as string) || "";
+  const returnTo = (req.query.returnTo as string) || "/community";
+
   if (!userEmail) return res.status(400).json({ error: "userEmail es obligatorio" });
 
   const clientId = process.env.GITHUB_CLIENT_ID;
@@ -30,7 +43,7 @@ router.get("/login", async (req: Request, res: Response) => {
   }
 
   const state = Buffer.from(
-    JSON.stringify({ userEmail, ts: Date.now() }),
+    JSON.stringify({ userEmail, returnTo, ts: Date.now() }),
     "utf8"
   ).toString("base64url");
 
@@ -41,42 +54,40 @@ router.get("/login", async (req: Request, res: Response) => {
     state,
   });
 
-  return res.redirect(`${GITHUB_AUTHORIZE_URL}?${params.toString()}`);
+  return res.redirect(`https://github.com/login/oauth/authorize?${params.toString()}`);
 });
 
+// -------------------------
+// GET /github/callback  ✅ ESTE ES EL QUE QUIERES
+// -------------------------
 router.get("/callback", async (req: Request, res: Response) => {
   try {
     const { code, state } = req.query as { code?: string; state?: string };
     if (!code) return res.status(400).json({ error: "code es obligatorio" });
 
     let userEmail = "";
+    let returnTo = "/community";
+
     if (state) {
       try {
         const parsed = JSON.parse(Buffer.from(state, "base64url").toString("utf8"));
-        userEmail = parsed.userEmail;
-      } catch (error) {
-        console.warn("[github:callback] state inválido", error);
-      }
+        userEmail = parsed.userEmail || "";
+        returnTo = parsed.returnTo || "/community";
+      } catch {}
     }
 
-    const resolvedUserEmail = userEmail || (req.query.userEmail as string);
-    if (!resolvedUserEmail) {
-      return res.status(400).json({ error: "userEmail no encontrado en state" });
-    }
+    if (!userEmail) return res.status(400).json({ error: "userEmail no encontrado en state" });
 
-    const token = await exchangeCodeForToken(
-      code,
-      process.env.GITHUB_CALLBACK_URL
-    );
+    const token = await exchangeCodeForToken(code, process.env.GITHUB_CALLBACK_URL);
 
     const client = createGithubClient(token);
     const user = await client.getAuthenticatedUser();
 
     await connectMongo();
-    const account = await GithubAccount.findOneAndUpdate(
-      { userEmail: resolvedUserEmail },
+    await GithubAccount.findOneAndUpdate(
+      { userEmail },
       {
-        userEmail: resolvedUserEmail,
+        userEmail,
         githubUserId: user.id,
         githubLogin: user.login,
         accessToken: token,
@@ -84,17 +95,22 @@ router.get("/callback", async (req: Request, res: Response) => {
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
-    return res.status(200).json({
-      ok: true,
-      githubLogin: account.githubLogin,
-      githubUserId: account.githubUserId,
-    });
+    const frontendBase = process.env.FRONTEND_URL || "http://localhost:3000";
+    const redirectUrl =
+      `${frontendBase}${returnTo}` +
+      `?github=connected&githubLogin=${encodeURIComponent(user.login)}`;
+
+    return res.redirect(302, redirectUrl);
   } catch (error) {
-    console.error("[github:callback] Error intercambiando token:", error);
-    return res.status(500).json({ error: "No se pudo conectar con GitHub" });
+    console.error("[github:callback] Error:", error);
+    const frontendBase = process.env.FRONTEND_URL || "http://localhost:3000";
+    return res.redirect(302, `${frontendBase}/community?github=error`);
   }
 });
 
+// -------------------------
+// POST /community/projects/:id/tasks/:taskId/link-repo
+// -------------------------
 router.post(
   "/community/projects/:id/tasks/:taskId/link-repo",
   async (
@@ -110,9 +126,7 @@ router.post(
       const { userEmail, repoFullName } = req.body || {};
 
       if (!userEmail || !repoFullName) {
-        return res
-          .status(400)
-          .json({ error: "userEmail y repoFullName son obligatorios" });
+        return res.status(400).json({ error: "userEmail y repoFullName son obligatorios" });
       }
 
       const [owner, repo] = repoFullName.split("/");
@@ -122,8 +136,7 @@ router.post(
 
       await connectMongo();
       const doc: any = await CommunityProject.findById(id);
-      if (!doc || !doc.isPublished)
-        return res.status(404).json({ error: "Proyecto no encontrado" });
+      if (!doc || !doc.isPublished) return res.status(404).json({ error: "Proyecto no encontrado" });
 
       await normalizeAndPersistTaskIds(doc);
 
@@ -132,12 +145,12 @@ router.post(
       const task = tasks.find((t) => String(t.id) === String(taskId));
       if (!task) return res.status(404).json({ error: "Tarea no encontrada" });
 
+      // Política simple: asignado o dueño del proyecto
       if (task.assigneeEmail !== userEmail && doc.ownerEmail !== userEmail) {
-        return res
-          .status(403)
-          .json({ error: "Solo el asignado o dueño puede vincular un repo" });
+        return res.status(403).json({ error: "Solo el asignado o dueño puede vincular un repo" });
       }
 
+      // Comprueba acceso al repo con el token del userEmail
       const { client } = await getOctokitForEmail(userEmail);
       await client.getRepo(owner, repo);
 
@@ -148,6 +161,7 @@ router.post(
         checks: task.repo?.checks || { status: "IDLE" },
       };
 
+      // Si ya está en review, lo marcamos SUBMITTED
       if ((task.columnId as string) === "review") {
         task.verificationStatus = "SUBMITTED";
         task.verification = task.verification || { status: "SUBMITTED" };
@@ -163,12 +177,14 @@ router.post(
       return res.status(200).json({ tasks: tasks.map((t) => mapTaskToBoard(t)) });
     } catch (error: any) {
       console.error("[github:link-repo] Error:", error);
-      const message = error?.message || "Error vinculando repo";
-      return res.status(500).json({ error: message });
+      return res.status(500).json({ error: error?.message || "Error vinculando repo" });
     }
   }
 );
 
+// -------------------------
+// POST /community/projects/:id/tasks/:taskId/run-verify
+// -------------------------
 router.post(
   "/community/projects/:id/tasks/:taskId/run-verify",
   async (
@@ -183,8 +199,7 @@ router.post(
 
       await connectMongo();
       const doc: any = await CommunityProject.findById(id);
-      if (!doc || !doc.isPublished)
-        return res.status(404).json({ error: "Proyecto no encontrado" });
+      if (!doc || !doc.isPublished) return res.status(404).json({ error: "Proyecto no encontrado" });
 
       await normalizeAndPersistTaskIds(doc);
 
@@ -206,7 +221,6 @@ router.post(
       await client.getRepo(owner, repo);
 
       ensureTaskDefaults(task);
-      task.repo = task.repo || { provider: "github" };
       task.repo.checks = { ...(task.repo.checks || {}), status: "PENDING" };
       task.verificationStatus = task.verificationStatus || "SUBMITTED";
       task.verification = task.verification || { status: "SUBMITTED" };
@@ -221,17 +235,14 @@ router.post(
       try {
         const workflows = await client.listWorkflows(owner, repo);
         const workflow =
-          workflows?.workflows?.find((w: any) =>
-            String(w?.path || "").endsWith("verify.yml")
-          ) || workflows?.workflows?.find((w: any) => w?.name === "verify");
+          workflows?.workflows?.find((w: any) => String(w?.path || "").endsWith("verify.yml")) ||
+          workflows?.workflows?.find((w: any) => w?.name === "verify");
 
         if (workflow?.id) {
           const repoInfo = await client.getRepo(owner, repo);
           const ref = repoInfo?.default_branch || "main";
           await client.dispatchWorkflow(owner, repo, workflow.id, ref);
-          console.log(
-            `[github:run-verify] Disparado workflow ${workflow.id} en ${owner}/${repo} ref ${ref}`
-          );
+          console.log(`[github:run-verify] workflow ${workflow.id} dispatch ${owner}/${repo} ref=${ref}`);
         }
       } catch (err) {
         console.warn("[github:run-verify] No se pudo disparar workflow:", err);
@@ -245,5 +256,14 @@ router.post(
     }
   }
 );
+router.get("/status", async (req: Request, res: Response) => {
+  const userEmail = String(req.query.userEmail || "").trim();
+  if (!userEmail) return res.status(400).json({ error: "userEmail es obligatorio" });
+
+  await connectMongo();
+  const acc = await GithubAccount.findOne({ userEmail }).lean();
+
+  return res.status(200).json({ connected: !!acc?.accessToken, githubLogin: acc?.githubLogin || null });
+});
 
 export default router;
