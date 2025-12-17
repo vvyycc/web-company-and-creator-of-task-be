@@ -5,7 +5,6 @@ import { GithubAccount } from "../models/GithubAccount";
 import {
   exchangeCodeForToken,
   getOctokitForEmail,
-  createGithubClient,
 } from "../services/github";
 import {
   mapTaskToBoard,
@@ -51,6 +50,7 @@ router.get("/login", async (req: Request, res: Response) => {
     client_id: clientId,
     redirect_uri: callbackUrl,
     scope: "repo read:user workflow",
+    prompt: "consent",
     state,
   });
 
@@ -80,8 +80,26 @@ router.get("/callback", async (req: Request, res: Response) => {
 
     const token = await exchangeCodeForToken(code, process.env.GITHUB_CALLBACK_URL);
 
-    const client = createGithubClient(token);
-    const user = await client.getAuthenticatedUser();
+    const userRes = await fetch("https://api.github.com/user", {
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${token}`,
+        "User-Agent": "community-verifier/1.0",
+      },
+    });
+
+    if (!userRes.ok) {
+      const text = await userRes.text();
+      throw new Error(`github_user_fetch_failed:${userRes.status}:${text}`);
+    }
+
+    const scopesHeader = userRes.headers.get("x-oauth-scopes") || "";
+    const scopes = scopesHeader
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const user = await userRes.json();
 
     await connectMongo();
     await GithubAccount.findOneAndUpdate(
@@ -91,6 +109,7 @@ router.get("/callback", async (req: Request, res: Response) => {
         githubUserId: user.id,
         githubLogin: user.login,
         accessToken: token,
+        scopes,
       },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
@@ -263,7 +282,13 @@ router.get("/status", async (req: Request, res: Response) => {
   await connectMongo();
   const acc = await GithubAccount.findOne({ userEmail }).lean();
 
-  return res.status(200).json({ connected: !!acc?.accessToken, githubLogin: acc?.githubLogin || null });
+  return res
+    .status(200)
+    .json({
+      connected: !!acc?.accessToken,
+      githubLogin: acc?.githubLogin || null,
+      scopes: acc?.scopes || [],
+    });
 });
 
 export default router;

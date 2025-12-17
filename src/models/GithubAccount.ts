@@ -5,6 +5,7 @@ export interface GithubAccountDocument extends Document {
   githubUserId: number;
   githubLogin: string;
   accessToken: string;
+  scopes?: string[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -15,6 +16,7 @@ const GithubAccountSchema = new Schema<GithubAccountDocument>(
     githubUserId: { type: Number, required: true, unique: true },
     githubLogin: { type: String, required: true },
     accessToken: { type: String, required: true },
+    scopes: { type: [String], default: [] },
   },
   { timestamps: true }
 );

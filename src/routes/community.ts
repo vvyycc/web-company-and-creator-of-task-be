@@ -3,7 +3,10 @@ import express, { Request, Response } from "express";
 import mongoose from "mongoose";
 import { connectMongo } from "../db/mongo";
 import { CommunityProject } from "../models/CommunityProject";
+import { GithubAccount } from "../models/GithubAccount";
+import { RepoMembership } from "../models/RepoMembership";
 import { getIO } from "../socket";
+import { checkCollaborator, createProjectRepo } from "../services/github";
 
 export type ColumnId = "todo" | "doing" | "review" | "done";
 
@@ -75,6 +78,64 @@ const BOARD_COLUMNS: Array<{ id: ColumnId; title: string; order: number }> = [
 ];
 
 const MAX_DOING_PER_USER = 2;
+
+async function updateMembership(
+  projectId: string,
+  userEmail: string,
+  githubLogin: string,
+  status: "INVITED" | "ACCEPTED",
+  timestamps: Partial<{ invitedAt: Date; acceptedAt: Date; lastCheckedAt: Date }>
+) {
+  return RepoMembership.findOneAndUpdate(
+    { projectId, userEmail },
+    {
+      projectId,
+      userEmail,
+      githubLogin,
+      status,
+      ...timestamps,
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+}
+
+async function isRepoAccepted(doc: any, userEmail: string) {
+  if (doc?.ownerEmail === userEmail) return true;
+
+  const repoFullName = doc?.projectRepo?.fullName;
+  if (!repoFullName) return false;
+
+  const userAccount = await GithubAccount.findOne({ userEmail });
+  const ownerAccount = await GithubAccount.findOne({ userEmail: doc.ownerEmail });
+
+  if (!userAccount || !ownerAccount) return false;
+
+  try {
+    const accepted = await checkCollaborator(
+      repoFullName,
+      userAccount.githubLogin,
+      ownerAccount.accessToken
+    );
+
+    await RepoMembership.findOneAndUpdate(
+      { projectId: doc._id, userEmail },
+      {
+        projectId: doc._id,
+        userEmail,
+        githubLogin: userAccount.githubLogin,
+        status: accepted ? "ACCEPTED" : "INVITED",
+        acceptedAt: accepted ? new Date() : undefined,
+        lastCheckedAt: new Date(),
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    return accepted;
+  } catch (error) {
+    console.error("[repo] Error comprobando colaborador:", error);
+    return false;
+  }
+}
 
 function isValidObjectIdString(v: unknown) {
   return typeof v === "string" && mongoose.Types.ObjectId.isValid(v);
@@ -242,7 +303,10 @@ router.post(
         estimation?: any;
       }
     >,
-    res: Response<{ id: string; publicUrl: string } | { error: string }>
+    res: Response<
+      | { id: string; publicUrl: string; repo?: { fullName: string; htmlUrl: string } }
+      | { error: string }
+    >
   ) => {
     try {
       const { ownerEmail, projectTitle, projectDescription, estimation } =
@@ -256,6 +320,16 @@ router.post(
       }
 
       await connectMongo();
+
+      const ownerAccount = await GithubAccount.findOne({ userEmail: ownerEmail });
+      if (!ownerAccount) {
+        return res.status(400).json({ error: "github_not_connected_owner" });
+      }
+
+      const hasRepoScope = (ownerAccount.scopes || []).includes("repo");
+      if (!hasRepoScope) {
+        return res.status(403).json({ error: "missing_repo_scope" });
+      }
 
       const tasks: any[] = Array.isArray(estimation?.tasks)
         ? estimation.tasks
@@ -302,6 +376,23 @@ router.post(
         isPublished: true,
       });
 
+      try {
+        const repo = await createProjectRepo(
+          ownerEmail,
+          doc._id.toString(),
+          projectTitle,
+          projectDescription
+        );
+
+        doc.projectRepo = repo;
+        doc.repoSlug = repo.repoName;
+        await doc.save();
+      } catch (error) {
+        console.error("[community] Error creando repositorio:", error);
+        await doc.deleteOne();
+        return res.status(500).json({ error: "github_create_repo_failed" });
+      }
+
       const id = doc._id.toString();
       const publicUrl = `/community/${id}`;
 
@@ -325,7 +416,9 @@ router.post(
         publishedAt: doc.createdAt ?? doc.updatedAt,
       });
 
-      return res.status(200).json({ id, publicUrl });
+      return res
+        .status(200)
+        .json({ id, publicUrl, repo: { fullName: doc.projectRepo.fullName, htmlUrl: doc.projectRepo.htmlUrl } });
     } catch (error) {
       console.error("[community] Error creando proyecto de comunidad:", error);
       return res
@@ -471,6 +564,234 @@ router.delete(
   }
 );
 
+// ----------------- INVITE TO REPO (owner) -----------------
+router.post(
+  "/projects/:projectId/repo/invite",
+  async (
+    req: Request<{ projectId: string }, unknown, { ownerEmail?: string; userEmailToInvite?: string }>,
+    res: Response
+  ) => {
+    try {
+      const { projectId } = req.params;
+      const { ownerEmail, userEmailToInvite } = req.body || {};
+
+      if (!ownerEmail || !userEmailToInvite) {
+        return res.status(400).json({ error: "ownerEmail y userEmailToInvite son obligatorios" });
+      }
+
+      await connectMongo();
+      const doc: any = await CommunityProject.findById(projectId);
+      if (!doc || !doc.isPublished) return res.status(404).json({ error: "Proyecto no encontrado" });
+
+      if (String(doc.ownerEmail).toLowerCase() !== String(ownerEmail).toLowerCase()) {
+        return res.status(403).json({ error: "No autorizado" });
+      }
+
+      if (!doc.projectRepo?.fullName) {
+        return res.status(404).json({ error: "Repositorio no disponible" });
+      }
+
+      const ownerAccount = await GithubAccount.findOne({ userEmail: ownerEmail });
+      if (!ownerAccount) return res.status(400).json({ error: "github_not_connected_owner" });
+      if (!(ownerAccount.scopes || []).includes("repo")) {
+        return res.status(403).json({ error: "missing_repo_scope" });
+      }
+
+      const invitedAccount = await GithubAccount.findOne({ userEmail: userEmailToInvite });
+      if (!invitedAccount)
+        return res.status(400).json({ error: "github_not_connected_user" });
+
+      const [owner, repo] = doc.projectRepo.fullName.split("/");
+      const inviteRes = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/collaborators/${invitedAccount.githubLogin}`,
+        {
+          method: "PUT",
+          headers: {
+            Accept: "application/vnd.github+json",
+            Authorization: `Bearer ${ownerAccount.accessToken}`,
+            "User-Agent": "community-verifier/1.0",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ permission: "push" }),
+        }
+      );
+
+      if (![201, 202, 204].includes(inviteRes.status)) {
+        const text = await inviteRes.text();
+        if (inviteRes.status === 404 || inviteRes.status === 403 || inviteRes.status === 422) {
+          return res.status(inviteRes.status).json({ error: text || "github_invite_failed" });
+        }
+        console.error("[community] Invite failed", inviteRes.status, text);
+        return res.status(500).json({ error: "github_invite_failed" });
+      }
+
+      await updateMembership(
+        projectId,
+        userEmailToInvite,
+        invitedAccount.githubLogin,
+        "INVITED",
+        { invitedAt: new Date(), lastCheckedAt: new Date() }
+      );
+
+      const io = getIO();
+      io.to(userEmailToInvite).emit("community:userInvitedToRepo", {
+        projectId,
+        repoUrl: doc.projectRepo.htmlUrl,
+      });
+
+      return res
+        .status(200)
+        .json({ ok: true, status: "INVITED", repoUrl: doc.projectRepo.htmlUrl });
+    } catch (error) {
+      console.error("[community] Error invitando al repo:", error);
+      return res.status(500).json({ error: "github_invite_failed" });
+    }
+  }
+);
+
+// ----------------- REPO STATUS -----------------
+router.get(
+  "/projects/:projectId/repo/status",
+  async (
+    req: Request<{ projectId: string }, unknown, unknown, { userEmail?: string }>,
+    res: Response
+  ) => {
+    try {
+      const { projectId } = req.params;
+      const userEmail = String(req.query.userEmail || "").trim();
+
+      if (!userEmail) return res.status(400).json({ error: "userEmail es obligatorio" });
+
+      await connectMongo();
+      const doc: any = await CommunityProject.findById(projectId);
+      if (!doc || !doc.isPublished)
+        return res.status(404).json({ error: "Proyecto no encontrado" });
+
+      if (!doc.projectRepo?.fullName) {
+        return res.status(200).json({ joined: false, status: "NOT_READY" });
+      }
+
+      const userAccount = await GithubAccount.findOne({ userEmail });
+      if (!userAccount) {
+        return res.status(200).json({ joined: false, status: "NOT_CONNECTED" });
+      }
+
+      const ownerAccount = await GithubAccount.findOne({ userEmail: doc.ownerEmail });
+      if (!ownerAccount) {
+        return res.status(200).json({ joined: false, status: "NOT_CONNECTED" });
+      }
+
+      const joined = await checkCollaborator(
+        doc.projectRepo.fullName,
+        userAccount.githubLogin,
+        ownerAccount.accessToken
+      );
+
+      if (joined) {
+        await updateMembership(
+          projectId,
+          userEmail,
+          userAccount.githubLogin,
+          "ACCEPTED",
+          { acceptedAt: new Date(), lastCheckedAt: new Date() }
+        );
+        return res.status(200).json({
+          joined: true,
+          status: "ACCEPTED",
+          repoUrl: doc.projectRepo.htmlUrl,
+        });
+      }
+
+      await updateMembership(
+        projectId,
+        userEmail,
+        userAccount.githubLogin,
+        "INVITED",
+        { lastCheckedAt: new Date() }
+      );
+
+      return res.status(200).json({
+        joined: false,
+        status: "INVITED_OR_NOT",
+        repoUrl: doc.projectRepo.htmlUrl,
+      });
+    } catch (error) {
+      console.error("[community] Error consultando estado de repo:", error);
+      return res.status(500).json({ error: "repo_status_failed" });
+    }
+  }
+);
+
+// ----------------- REPO JOIN -----------------
+router.post(
+  "/projects/:projectId/repo/join",
+  async (
+    req: Request<{ projectId: string }, unknown, { userEmail?: string }>,
+    res: Response
+  ) => {
+    try {
+      const { projectId } = req.params;
+      const { userEmail } = req.body || {};
+
+      if (!userEmail) return res.status(400).json({ error: "userEmail es obligatorio" });
+
+      await connectMongo();
+      const doc: any = await CommunityProject.findById(projectId);
+      if (!doc || !doc.isPublished) return res.status(404).json({ error: "Proyecto no encontrado" });
+
+      if (!doc.projectRepo?.fullName) {
+        return res.status(404).json({ error: "Repositorio no disponible" });
+      }
+
+      const userAccount = await GithubAccount.findOne({ userEmail });
+      if (!userAccount)
+        return res.status(400).json({ error: "github_not_connected_user" });
+
+      const ownerAccount = await GithubAccount.findOne({ userEmail: doc.ownerEmail });
+      if (!ownerAccount)
+        return res.status(400).json({ error: "github_not_connected_owner" });
+
+      const alreadyMember = await checkCollaborator(
+        doc.projectRepo.fullName,
+        userAccount.githubLogin,
+        ownerAccount.accessToken
+      );
+
+      if (alreadyMember) {
+        await updateMembership(
+          projectId,
+          userEmail,
+          userAccount.githubLogin,
+          "ACCEPTED",
+          { acceptedAt: new Date(), lastCheckedAt: new Date() }
+        );
+
+        return res.status(200).json({
+          ok: true,
+          joined: true,
+          status: "ACCEPTED",
+          repoUrl: doc.projectRepo.htmlUrl,
+        });
+      }
+
+      const existing = await RepoMembership.findOne({ projectId, userEmail });
+      if (existing?.status === "INVITED") {
+        return res.status(200).json({
+          ok: true,
+          joined: false,
+          action: "ACCEPT_INVITE",
+          repoUrl: doc.projectRepo.htmlUrl,
+        });
+      }
+
+      return res.status(403).json({ error: "not_invited_yet" });
+    } catch (error) {
+      console.error("[community] Error join repo:", error);
+      return res.status(500).json({ error: "join_repo_failed" });
+    }
+  }
+);
+
 // ----------------- ASSIGN (todo -> doing) -----------------
 router.post(
   "/projects/:id/tasks/:taskId/assign",
@@ -501,6 +822,14 @@ router.post(
         return res
           .status(403)
           .json({ error: "El creador del proyecto no puede tomar tareas" });
+      }
+
+      const joined = await isRepoAccepted(doc, userEmail);
+      if (!joined) {
+        console.warn(
+          `[community] Movimiento bloqueado repo_not_joined project=${id} user=${userEmail}`
+        );
+        return res.status(403).json({ error: "repo_not_joined" });
       }
 
       const estimation: any = doc.estimation || {};
@@ -578,6 +907,16 @@ router.post(
         return res.status(403).json({ error: "No eres el asignado a esta tarea" });
       }
 
+      if (doc.ownerEmail !== userEmail) {
+        const joined = await isRepoAccepted(doc, userEmail);
+        if (!joined) {
+          console.warn(
+            `[community] Movimiento bloqueado repo_not_joined project=${id} user=${userEmail}`
+          );
+          return res.status(403).json({ error: "repo_not_joined" });
+        }
+      }
+
       if ((task.columnId ?? "todo") !== "doing") {
         return res.status(400).json({ error: 'Solo se pueden desasignar tareas en "Haciendo"' });
       }
@@ -630,6 +969,16 @@ router.post(
 
       if (task.assigneeEmail !== userEmail) {
         return res.status(403).json({ error: "Solo el asignado puede completarla" });
+      }
+
+      if (doc.ownerEmail !== userEmail) {
+        const joined = await isRepoAccepted(doc, userEmail);
+        if (!joined) {
+          console.warn(
+            `[community] Movimiento bloqueado repo_not_joined project=${id} user=${userEmail}`
+          );
+          return res.status(403).json({ error: "repo_not_joined" });
+        }
       }
 
       if ((task.columnId ?? "todo") !== "doing") {
