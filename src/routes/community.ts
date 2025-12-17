@@ -2,8 +2,11 @@
 import express, { Request, Response } from "express";
 import mongoose from "mongoose";
 import { connectMongo } from "../db/mongo";
-import { CommunityProject } from "../models/CommunityProject";
+import { CommunityProject, ProjectRepo } from "../models/CommunityProject";
+import { GithubAccount } from "../models/GithubAccount";
 import { getIO } from "../socket";
+import { createProjectRepo } from "../services/github/createProjectRepo";
+import { inviteUserToRepo } from "../services/github/inviteUserToRepo";
 
 export type ColumnId = "todo" | "doing" | "review" | "done";
 
@@ -228,6 +231,28 @@ const emitCommunityProjectDeleted = (payload: { id: string }) => {
   io.to("community:list").emit("community:projectDeleted", payload);
 };
 
+const emitRepoCreated = (payload: {
+  projectId: string;
+  repo: ProjectRepo;
+  userEmail: string;
+  githubUsername?: string;
+}) => {
+  const io = getIO();
+  io.to(`community:${payload.projectId}`).emit("community:repoCreated", payload);
+};
+
+const emitUserInvitedToRepo = (payload: {
+  projectId: string;
+  repo: ProjectRepo;
+  userEmail: string;
+  githubUsername: string;
+}) => {
+  const io = getIO();
+  io
+    .to(`community:${payload.projectId}`)
+    .emit("community:userInvitedToRepo", payload);
+};
+
 // ----------------- POST publish -----------------
 router.post(
   "/projects",
@@ -294,7 +319,7 @@ router.post(
         };
       });
 
-      const doc: any = await CommunityProject.create({
+      const doc: any = new CommunityProject({
         ownerEmail,
         projectTitle,
         projectDescription,
@@ -304,6 +329,27 @@ router.post(
 
       const id = doc._id.toString();
       const publicUrl = `/community/${id}`;
+
+      let projectRepo: ProjectRepo | undefined;
+      let ownerGithubUsername: string | undefined;
+
+      try {
+        const repoResult = await createProjectRepo(ownerEmail, id);
+        projectRepo = repoResult.repo;
+        ownerGithubUsername = repoResult.githubUsername;
+        doc.projectRepo = projectRepo;
+      } catch (error: any) {
+        if (error?.message === "github_account_not_found") {
+          return res.status(400).json({ error: "github_not_connected_owner" });
+        }
+
+        console.error("[community] Error creando repo de comunidad:", error);
+        return res
+          .status(500)
+          .json({ error: "Error creando repositorio del proyecto" });
+      }
+
+      await doc.save();
 
       // ✅ realtime: avisar a todos los que están en /community
       const tasksRaw: any[] = Array.isArray(estimation?.tasks)
@@ -324,6 +370,15 @@ router.post(
         tasksCount: tasksRaw.length,
         publishedAt: doc.createdAt ?? doc.updatedAt,
       });
+
+      if (projectRepo) {
+        emitRepoCreated({
+          projectId: id,
+          repo: projectRepo,
+          userEmail: ownerEmail,
+          githubUsername: ownerGithubUsername,
+        });
+      }
 
       return res.status(200).json({ id, publicUrl });
     } catch (error) {
@@ -497,11 +552,23 @@ router.post(
       // ✅ asegura ids válidos en proyectos antiguos antes de buscar
       await normalizeAndPersistTaskIds(doc);
 
+      const projectRepo: ProjectRepo | undefined = doc.projectRepo;
+      if (!projectRepo) {
+        return res.status(400).json({ error: "project_repo_missing" });
+      }
+
       if (doc.ownerEmail === userEmail) {
         return res
           .status(403)
           .json({ error: "El creador del proyecto no puede tomar tareas" });
       }
+
+      const assigneeGithubAccount = await GithubAccount.findOne({ userEmail });
+      if (!assigneeGithubAccount) {
+        return res.status(400).json({ error: "github_not_connected_user" });
+      }
+
+      const assigneeGithubUsername = assigneeGithubAccount.githubLogin;
 
       const estimation: any = doc.estimation || {};
       const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
@@ -534,12 +601,41 @@ router.post(
       task.status = "IN_PROGRESS";
       task.verificationStatus = task.verificationStatus ?? "NOT_SUBMITTED";
 
+      const shouldInvite =
+        !task.githubInvited || task.githubUsername !== assigneeGithubUsername;
+
+      if (shouldInvite) {
+        try {
+          await inviteUserToRepo(projectRepo, doc.ownerEmail, assigneeGithubUsername);
+          task.githubInvited = true;
+          task.githubUsername = assigneeGithubUsername;
+        } catch (inviteError: any) {
+          if (inviteError?.message === "github_account_not_found") {
+            return res.status(400).json({ error: "github_not_connected_owner" });
+          }
+
+          console.error("[community] Error invitando usuario al repo:", inviteError);
+          return res
+            .status(500)
+            .json({ error: "Error invitando al repositorio del proyecto" });
+        }
+      }
+
       estimation.tasks = tasks;
       doc.estimation = estimation;
       doc.markModified("estimation");
 
       await doc.save();
       emitBoardUpdate(id, tasks);
+
+      if (shouldInvite && task.githubInvited) {
+        emitUserInvitedToRepo({
+          projectId: id,
+          repo: projectRepo,
+          userEmail,
+          githubUsername: assigneeGithubUsername,
+        });
+      }
 
       return res.status(200).json({ tasks: tasks.map((t) => mapTaskToBoard(t)) });
     } catch (error) {
@@ -587,6 +683,8 @@ router.post(
       task.columnId = "todo";
       task.status = "TODO";
       task.verificationStatus = task.verificationStatus ?? "NOT_SUBMITTED";
+      task.githubInvited = false;
+      task.githubUsername = undefined;
 
       estimation.tasks = tasks;
       doc.estimation = estimation;
