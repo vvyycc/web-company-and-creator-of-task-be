@@ -4,6 +4,12 @@ import mongoose from "mongoose";
 import { connectMongo } from "../db/mongo";
 import { CommunityProject } from "../models/CommunityProject";
 import { getIO } from "../socket";
+import {
+  createProjectRepo,
+  ensureRepoMember,
+  inviteUserToRepo,
+  isGithubIntegrationPermissionError,
+} from "../services/communityRepo";
 
 export type ColumnId = "todo" | "doing" | "review" | "done";
 
@@ -75,6 +81,37 @@ const BOARD_COLUMNS: Array<{ id: ColumnId; title: string; order: number }> = [
 ];
 
 const MAX_DOING_PER_USER = 2;
+
+const mapRepoErrorToResponse = (error: any, res: Response<any>) => {
+  const code = error?.code || error?.message;
+
+  if (code === "github_permissions_missing" || isGithubIntegrationPermissionError(error)) {
+    res.status(500).json({ error: "github_permissions_missing" });
+    return true;
+  }
+
+  if (code === "github_not_connected_owner") {
+    res.status(400).json({ error: "github_not_connected_owner" });
+    return true;
+  }
+
+  if (code === "github_account_not_found") {
+    res.status(400).json({ error: "github_account_not_found" });
+    return true;
+  }
+
+  if (code === "community_project_not_found") {
+    res.status(404).json({ error: "Proyecto de comunidad no encontrado" });
+    return true;
+  }
+
+  if (code === "project_repo_missing" || code === "invalid_project_repo") {
+    res.status(400).json({ error: "project_repo_missing" });
+    return true;
+  }
+
+  return false;
+};
 
 function isValidObjectIdString(v: unknown) {
   return typeof v === "string" && mongoose.Types.ObjectId.isValid(v);
@@ -294,13 +331,40 @@ router.post(
         };
       });
 
+      const newId = new mongoose.Types.ObjectId();
       const doc: any = await CommunityProject.create({
+        _id: newId,
         ownerEmail,
         projectTitle,
         projectDescription,
         estimation,
         isPublished: true,
       });
+
+      try {
+        const repoInfo = await createProjectRepo(
+          ownerEmail,
+          newId.toString(),
+          projectTitle,
+          projectDescription
+        );
+
+        doc.projectRepo = repoInfo;
+        await doc.save();
+
+        const io = getIO();
+        io.to(`community:${newId.toString()}`).emit("community:repoCreated", {
+          projectId: newId.toString(),
+          repoFullName: repoInfo.fullName,
+          repoUrl: repoInfo.htmlUrl,
+        });
+      } catch (repoError: any) {
+        await doc.deleteOne();
+        if (mapRepoErrorToResponse(repoError, res)) return;
+
+        console.error("[community] Error creando repo de proyecto:", repoError);
+        return res.status(500).json({ error: "Error interno creando repo de comunidad" });
+      }
 
       const id = doc._id.toString();
       const publicUrl = `/community/${id}`;
@@ -372,6 +436,12 @@ router.get(
           ownerEmail: doc.ownerEmail,
           published: doc.isPublished,
         },
+        projectRepo: doc.projectRepo
+          ? {
+              fullName: doc.projectRepo.fullName,
+              htmlUrl: doc.projectRepo.htmlUrl,
+            }
+          : undefined,
         columns: BOARD_COLUMNS,
         tasks: rawTasks.map((t) => mapTaskToBoard(t)),
       });
@@ -380,6 +450,79 @@ router.get(
       return res
         .status(500)
         .json({ error: "Error interno obteniendo tablero de comunidad" });
+    }
+  }
+);
+
+// ----------------- REPO STATUS -----------------
+router.get(
+  "/projects/:id/repo/status",
+  async (req: Request<{ id: string }>, res: Response) => {
+    try {
+      const { id } = req.params;
+      const userEmail = String(req.query.userEmail || "").trim();
+      if (!userEmail) return res.status(400).json({ error: "userEmail es obligatorio" });
+
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ error: "Identificador de proyecto no válido" });
+      }
+
+      const status = await ensureRepoMember(id, userEmail);
+
+      return res.status(200).json({
+        joined: !!status?.joined,
+        repoUrl: status?.repoUrl,
+        repoFullName: status?.repoFullName,
+      });
+    } catch (error: any) {
+      if (mapRepoErrorToResponse(error, res)) return;
+
+      console.error("[community] Error obteniendo estado de repo:", error);
+      return res.status(500).json({ error: "Error interno obteniendo estado del repo" });
+    }
+  }
+);
+
+// ----------------- JOIN REPO -----------------
+router.post(
+  "/projects/:id/repo/join",
+  async (
+    req: Request<{ id: string }, unknown, { userEmail?: string }>,
+    res: Response
+  ) => {
+    try {
+      const { id } = req.params;
+      const userEmail = String(req.body?.userEmail || "").trim();
+
+      if (!userEmail) return res.status(400).json({ error: "userEmail es obligatorio" });
+
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        return res
+          .status(400)
+          .json({ error: "Identificador de proyecto no válido" });
+      }
+
+      const result = await inviteUserToRepo(id, userEmail);
+
+      const io = getIO();
+      io.to(`community:${id}`).emit("community:userInvitedToRepo", {
+        projectId: id,
+        userEmail,
+        repoUrl: result.repoUrl,
+      });
+
+      return res.status(200).json({
+        joined: !!result.joined,
+        repoUrl: result.repoUrl,
+        repoFullName: result.repoFullName,
+      });
+    } catch (error: any) {
+      if (mapRepoErrorToResponse(error, res)) return;
+
+      console.error("[community] Error invitando usuario al repo:", error);
+      return res.status(500).json({ error: "Error interno invitando al repo" });
     }
   }
 );
@@ -497,6 +640,16 @@ router.post(
       // ✅ asegura ids válidos en proyectos antiguos antes de buscar
       await normalizeAndPersistTaskIds(doc);
 
+      try {
+        const membership = await ensureRepoMember(id, userEmail);
+        if (!membership?.joined) {
+          return res.status(403).json({ error: "repo_access_required" });
+        }
+      } catch (error: any) {
+        if (mapRepoErrorToResponse(error, res)) return;
+        throw error;
+      }
+
       if (doc.ownerEmail === userEmail) {
         return res
           .status(403)
@@ -568,6 +721,16 @@ router.post(
 
       await normalizeAndPersistTaskIds(doc);
 
+      try {
+        const membership = await ensureRepoMember(id, userEmail);
+        if (!membership?.joined) {
+          return res.status(403).json({ error: "repo_access_required" });
+        }
+      } catch (error: any) {
+        if (mapRepoErrorToResponse(error, res)) return;
+        throw error;
+      }
+
       const estimation: any = doc.estimation || {};
       const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
 
@@ -599,6 +762,71 @@ router.post(
     } catch (error) {
       console.error("[community] Error desasignando tarea:", error);
       return res.status(500).json({ error: "Error interno desasignando tarea" });
+    }
+  }
+);
+
+// ----------------- SUBMIT REVIEW (doing -> review) -----------------
+router.post(
+  "/projects/:id/tasks/:taskId/submit-review",
+  async (
+    req: Request<{ id: string; taskId: string }, unknown, { userEmail?: string }>,
+    res: Response<{ tasks: BoardTask[] } | { error: string }>
+  ) => {
+    try {
+      const { id, taskId } = req.params;
+      const { userEmail } = req.body || {};
+      if (!userEmail) return res.status(400).json({ error: "userEmail es obligatorio" });
+
+      await connectMongo();
+
+      const doc: any = await CommunityProject.findById(id);
+      if (!doc || !doc.isPublished) return res.status(404).json({ error: "Proyecto no encontrado" });
+
+      await normalizeAndPersistTaskIds(doc);
+
+      try {
+        const membership = await ensureRepoMember(id, userEmail);
+        if (!membership?.joined) {
+          return res.status(403).json({ error: "repo_access_required" });
+        }
+      } catch (error: any) {
+        if (mapRepoErrorToResponse(error, res)) return;
+        throw error;
+      }
+
+      const estimation: any = doc.estimation || {};
+      const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
+
+      const task = tasks.find((t) => String(t.id) === String(taskId));
+      if (!task) return res.status(404).json({ error: "Tarea no encontrada" });
+
+      if (task.assigneeEmail !== userEmail) {
+        return res.status(403).json({ error: "Solo el asignado puede enviarla a revisión" });
+      }
+
+      if ((task.columnId ?? "todo") !== "doing") {
+        return res.status(400).json({ error: 'Solo se pueden enviar tareas en "Haciendo"' });
+      }
+
+      task.columnId = "review";
+      task.status = "IN_REVIEW";
+      task.verificationStatus = "SUBMITTED";
+      task.verification = task.verification || { status: "SUBMITTED" };
+      task.verification.status = task.verification.status || "SUBMITTED";
+      task.verificationNotes = task.verificationNotes ?? "";
+
+      estimation.tasks = tasks;
+      doc.estimation = estimation;
+      doc.markModified("estimation");
+
+      await doc.save();
+      emitBoardUpdate(id, tasks);
+
+      return res.status(200).json({ tasks: tasks.map((t) => mapTaskToBoard(t)) });
+    } catch (error) {
+      console.error("[community] Error enviando tarea a revisión:", error);
+      return res.status(500).json({ error: "Error interno enviando a revisión" });
     }
   }
 );

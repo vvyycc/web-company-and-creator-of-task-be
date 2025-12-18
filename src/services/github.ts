@@ -16,6 +16,26 @@ export type GithubClient = {
     workflowId: number | string,
     ref: string
   ) => Promise<void>;
+  createRepo: (payload: {
+    name: string;
+    description?: string;
+    private?: boolean;
+    auto_init?: boolean;
+  }) => Promise<any>;
+  getContent: (owner: string, repo: string, path: string) => Promise<any>;
+  createOrUpdateFile: (
+    owner: string,
+    repo: string,
+    path: string,
+    payload: { message: string; content: string; sha?: string }
+  ) => Promise<any>;
+  inviteCollaborator: (
+    owner: string,
+    repo: string,
+    username: string
+  ) => Promise<any>;
+  isCollaborator: (owner: string, repo: string, username: string) => Promise<boolean>;
+  listInvitations: (owner: string, repo: string) => Promise<any[]>;
 };
 
 async function githubRequest(
@@ -35,9 +55,12 @@ async function githubRequest(
 
   if (!res.ok) {
     const errorText = await res.text();
-    throw new Error(
+    const error: any = new Error(
       `GitHub API ${path} failed with ${res.status}: ${errorText || res.statusText}`
     );
+    error.status = res.status;
+    error.responseBody = errorText;
+    throw error;
   }
 
   if (res.status === 204) return null;
@@ -62,6 +85,43 @@ export function createGithubClient(token: string): GithubClient {
         method: "POST",
         body: JSON.stringify({ ref }),
       });
+    },
+    async createRepo(payload) {
+      return githubRequest(token, "/user/repos", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+    },
+    async getContent(owner: string, repo: string, path: string) {
+      return githubRequest(token, `/repos/${owner}/${repo}/contents/${encodeURI(path)}`);
+    },
+    async createOrUpdateFile(owner: string, repo: string, path: string, payload) {
+      return githubRequest(token, `/repos/${owner}/${repo}/contents/${encodeURI(path)}`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+    },
+    async inviteCollaborator(owner: string, repo: string, username: string) {
+      return githubRequest(
+        token,
+        `/repos/${owner}/${repo}/collaborators/${encodeURIComponent(username)}`,
+        { method: "PUT" }
+      );
+    },
+    async isCollaborator(owner: string, repo: string, username: string) {
+      try {
+        await githubRequest(
+          token,
+          `/repos/${owner}/${repo}/collaborators/${encodeURIComponent(username)}`
+        );
+        return true;
+      } catch (error: any) {
+        if (error?.status === 404) return false;
+        throw error;
+      }
+    },
+    async listInvitations(owner: string, repo: string) {
+      return githubRequest(token, `/repos/${owner}/${repo}/invitations`);
     },
   };
 }
