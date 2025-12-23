@@ -20,6 +20,11 @@ export interface CommunityProjectDocument extends Document {
   projectTitle: string;
   projectDescription: string;
   estimation: ProjectEstimation;
+  projectRepo?: {
+    name?: string;
+    fullName: string;
+    htmlUrl: string;
+  };
   isPublished: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -32,6 +37,11 @@ const CommunityProjectSchema = new Schema<CommunityProjectDocument>(
     projectDescription: { type: String, required: true },
     // Usamos Mixed para no pelear con el tipado de subdocumentos
     estimation: { type: Schema.Types.Mixed, required: true },
+    projectRepo: {
+      name: { type: String },
+      fullName: { type: String },
+      htmlUrl: { type: String },
+    },
     isPublished: { type: Boolean, default: true },
   },
   { timestamps: true }

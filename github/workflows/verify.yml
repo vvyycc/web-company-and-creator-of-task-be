@@ -1,0 +1,31 @@
+name: verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      projectId:
+        description: "Community project id"
+        required: true
+      taskId:
+        description: "Task id"
+        required: true
+  push:
+    branches: ["main", "master"]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show inputs
+        run: |
+          echo "projectId=${{ github.event.inputs.projectId }}"
+          echo "taskId=${{ github.event.inputs.taskId }}"
+
+      # ✅ aquí pones tu verificación real (tests, lint, build, etc.)
+      - name: Dummy verification
+        run: |
+          echo "Running verification..."
+          exit 0
