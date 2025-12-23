@@ -7,42 +7,49 @@ const GITHUB_API_BASE = "https://api.github.com";
 
 export type GithubClient = {
   token: string;
+
   getAuthenticatedUser: () => Promise<{ id: number; login: string }>;
   getRepo: (owner: string, repo: string) => Promise<any>;
+
   listWorkflows: (owner: string, repo: string) => Promise<any>;
+
+  // ✅ IMPORTANTE: mantener firma con 6 args (como te lo pide TS)
   dispatchWorkflow: (
     owner: string,
     repo: string,
     workflowId: number | string,
-    ref: string
+    ref: string,
+    projectId: string | number,
+    taskId: string | number
   ) => Promise<void>;
+
   createRepo: (payload: {
     name: string;
     description?: string;
     private?: boolean;
     auto_init?: boolean;
   }) => Promise<any>;
+
   getContent: (owner: string, repo: string, path: string) => Promise<any>;
+
   createOrUpdateFile: (
     owner: string,
     repo: string,
     path: string,
     payload: { message: string; content: string; sha?: string }
   ) => Promise<any>;
-  inviteCollaborator: (
-    owner: string,
-    repo: string,
-    username: string
-  ) => Promise<any>;
+
+  inviteCollaborator: (owner: string, repo: string, username: string) => Promise<any>;
   isCollaborator: (owner: string, repo: string, username: string) => Promise<boolean>;
   listInvitations: (owner: string, repo: string) => Promise<any[]>;
+  deleteRepo: (owner: string, repo: string) => Promise<void>;
+
+  // ✅ NUEVO: refs (ramas)
+  getRef: (owner: string, repo: string, ref: string) => Promise<any>;
+  createRef: (owner: string, repo: string, ref: string, sha: string) => Promise<any>;
 };
 
-async function githubRequest(
-  token: string,
-  path: string,
-  options: RequestInit = {}
-): Promise<any> {
+async function githubRequest(token: string, path: string, options: RequestInit = {}): Promise<any> {
   const res = await fetch(`${GITHUB_API_BASE}${path}`, {
     ...options,
     headers: {
@@ -70,37 +77,59 @@ async function githubRequest(
 export function createGithubClient(token: string): GithubClient {
   return {
     token,
+
     async getAuthenticatedUser() {
       const data = await githubRequest(token, "/user");
       return { id: data.id, login: data.login };
     },
+
     async getRepo(owner: string, repo: string) {
       return githubRequest(token, `/repos/${owner}/${repo}`);
     },
+
     async listWorkflows(owner: string, repo: string) {
       return githubRequest(token, `/repos/${owner}/${repo}/actions/workflows`);
     },
-    async dispatchWorkflow(owner: string, repo: string, workflowId: number | string, ref: string) {
+
+    // ✅ FIX: ahora acepta projectId/taskId (aunque tu workflow no los use, TS lo exige)
+    async dispatchWorkflow(
+      owner: string,
+      repo: string,
+      workflowId: number | string,
+      ref: string,
+      projectId: string | number,
+      taskId: string | number
+    ) {
       await githubRequest(token, `/repos/${owner}/${repo}/actions/workflows/${workflowId}/dispatches`, {
         method: "POST",
-        body: JSON.stringify({ ref }),
+        body: JSON.stringify({
+          ref,
+          inputs: {
+            projectId: String(projectId),
+            taskId: String(taskId),
+          },
+        }),
       });
     },
+
     async createRepo(payload) {
       return githubRequest(token, "/user/repos", {
         method: "POST",
         body: JSON.stringify(payload),
       });
     },
+
     async getContent(owner: string, repo: string, path: string) {
       return githubRequest(token, `/repos/${owner}/${repo}/contents/${encodeURI(path)}`);
     },
+
     async createOrUpdateFile(owner: string, repo: string, path: string, payload) {
       return githubRequest(token, `/repos/${owner}/${repo}/contents/${encodeURI(path)}`, {
         method: "PUT",
         body: JSON.stringify(payload),
       });
     },
+
     async inviteCollaborator(owner: string, repo: string, username: string) {
       return githubRequest(
         token,
@@ -108,20 +137,37 @@ export function createGithubClient(token: string): GithubClient {
         { method: "PUT" }
       );
     },
+
     async isCollaborator(owner: string, repo: string, username: string) {
       try {
-        await githubRequest(
-          token,
-          `/repos/${owner}/${repo}/collaborators/${encodeURIComponent(username)}`
-        );
+        await githubRequest(token, `/repos/${owner}/${repo}/collaborators/${encodeURIComponent(username)}`);
         return true;
       } catch (error: any) {
         if (error?.status === 404) return false;
         throw error;
       }
     },
+
     async listInvitations(owner: string, repo: string) {
       return githubRequest(token, `/repos/${owner}/${repo}/invitations`);
+    },
+
+    async deleteRepo(owner: string, repo: string) {
+      await githubRequest(token, `/repos/${owner}/${repo}`, { method: "DELETE" });
+    },
+
+    // ✅ NUEVO: getRef / createRef
+    async getRef(owner: string, repo: string, ref: string) {
+      // ref ejemplo: "heads/main" o "heads/my-branch"
+      return githubRequest(token, `/repos/${owner}/${repo}/git/ref/${encodeURIComponent(ref)}`);
+    },
+
+    async createRef(owner: string, repo: string, ref: string, sha: string) {
+      // ref ejemplo: "refs/heads/my-branch"
+      return githubRequest(token, `/repos/${owner}/${repo}/git/refs`, {
+        method: "POST",
+        body: JSON.stringify({ ref, sha }),
+      });
     },
   };
 }
@@ -135,10 +181,7 @@ export async function exchangeCodeForToken(code: string, redirectUri?: string) {
 
   const res = await fetch("https://github.com/login/oauth/access_token", {
     method: "POST",
-    headers: {
-      Accept: "application/json",
-      "Content-Type": "application/json",
-    },
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
     body: JSON.stringify({
       client_id: clientId,
       client_secret: clientSecret,
@@ -183,10 +226,7 @@ export function verifyGithubSignature(req: Request): boolean {
     ? body
     : Buffer.from(typeof body === "string" ? body : JSON.stringify(body));
 
-  const digest = `sha256=${crypto
-    .createHmac("sha256", secret)
-    .update(payloadBuffer)
-    .digest("hex")}`;
+  const digest = `sha256=${crypto.createHmac("sha256", secret).update(payloadBuffer).digest("hex")}`;
 
   try {
     return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(digest));
@@ -194,4 +234,20 @@ export function verifyGithubSignature(req: Request): boolean {
     console.error("[github:webhook] Error comparando firmas:", error);
     return false;
   }
+}
+
+export async function deleteGithubRepoForOwner(ownerEmail: string, repoFullName: string) {
+  const { client } = await getOctokitForEmail(ownerEmail);
+
+  const me = await client.getAuthenticatedUser();
+  const [owner, repo] = repoFullName.split("/");
+
+  const repoInfo = await client.getRepo(owner, repo);
+  const hasAdmin = Boolean(repoInfo?.permissions?.admin);
+
+  if (!hasAdmin) {
+    throw new Error(`El token (${me.login}) no tiene admin sobre ${owner}/${repo}`);
+  }
+
+  await client.deleteRepo(owner, repo);
 }

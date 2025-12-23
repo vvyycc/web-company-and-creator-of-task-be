@@ -19,6 +19,15 @@ type RepoContext = {
   ownerToken: string;
 };
 
+export type RepoMemberState = "NONE" | "INVITED" | "ACTIVE";
+
+export type RepoMemberStatus = {
+  joined: boolean;           // compatibilidad
+  state: RepoMemberState;    // NUEVO
+  repoFullName: string;
+  repoUrl: string;
+};
+
 const GITHUB_PERMISSION_ERROR = "github_permissions_missing";
 
 const slugify = (value: string, fallback: string) => {
@@ -161,16 +170,19 @@ export async function createProjectRepo(
   };
 }
 
-async function checkRepoMembership(projectId: string, userEmail: string) {
+async function checkRepoMembership(projectId: string, userEmail: string): Promise<RepoMemberStatus> {
   const context = await getRepoContext(projectId);
   const userAccount = await GithubAccount.findOne({ userEmail }).lean();
+
+  // No tiene cuenta github conectada => no puede aceptar ni colaborar
   if (!userAccount) {
-    return { joined: false, repoFullName: context.repoFullName, repoUrl: context.repoUrl };
+    return { joined: false, state: "NONE", repoFullName: context.repoFullName, repoUrl: context.repoUrl };
   }
 
   const client = createGithubClient(context.ownerToken);
 
   try {
+    // 1) ¿Ya es collaborator REAL? => ACTIVE
     const isMember = await client.isCollaborator(
       context.repoOwner,
       context.repoName,
@@ -179,11 +191,12 @@ async function checkRepoMembership(projectId: string, userEmail: string) {
 
     if (isMember) {
       console.log(
-        `[community:repo] member check ok project=${projectId} user=${userEmail} login=${userAccount.githubLogin}`
+        `[community:repo] member check ACTIVE project=${projectId} user=${userEmail} login=${userAccount.githubLogin}`
       );
-      return { joined: true, repoFullName: context.repoFullName, repoUrl: context.repoUrl };
+      return { joined: true, state: "ACTIVE", repoFullName: context.repoFullName, repoUrl: context.repoUrl };
     }
 
+    // 2) Si NO es collaborator, miramos invitaciones pendientes => INVITED
     let invitations: any[] = [];
     try {
       invitations =
@@ -205,16 +218,18 @@ async function checkRepoMembership(projectId: string, userEmail: string) {
 
     if (hasInvite) {
       console.log(
-        `[community:repo] member check ok (invited) project=${projectId} user=${userEmail} login=${userAccount.githubLogin}`
+        `[community:repo] member check INVITED project=${projectId} user=${userEmail} login=${userAccount.githubLogin}`
       );
-      return { joined: true, repoFullName: context.repoFullName, repoUrl: context.repoUrl };
+
+      // OJO: joined=true solo por compatibilidad, pero state=INVITED
+      return { joined: true, state: "INVITED", repoFullName: context.repoFullName, repoUrl: context.repoUrl };
     }
 
     console.warn(
-      `[community:repo] member check failed project=${projectId} user=${userEmail} login=${userAccount.githubLogin}`
+      `[community:repo] member check NONE project=${projectId} user=${userEmail} login=${userAccount.githubLogin}`
     );
 
-    return { joined: false, repoFullName: context.repoFullName, repoUrl: context.repoUrl };
+    return { joined: false, state: "NONE", repoFullName: context.repoFullName, repoUrl: context.repoUrl };
   } catch (error: any) {
     if (isGithubIntegrationPermissionError(error)) {
       const wrapped: any = new Error(GITHUB_PERMISSION_ERROR);
@@ -224,6 +239,7 @@ async function checkRepoMembership(projectId: string, userEmail: string) {
     throw error;
   }
 }
+
 
 export async function ensureRepoMember(projectId: string, userEmail: string) {
   return checkRepoMembership(projectId, userEmail);
@@ -262,9 +278,11 @@ export async function inviteUserToRepo(projectId: string, userEmail: string) {
     `[community:repo] invite sent project=${projectId} user=${userEmail} login=${userAccount.githubLogin}`
   );
 
-  return {
-    joined: true,
-    repoFullName: context.repoFullName,
-    repoUrl: context.repoUrl,
-  };
+return {
+  joined: true,
+  state: "INVITED",
+  repoFullName: context.repoFullName,
+  repoUrl: context.repoUrl,
+};
+
 }
