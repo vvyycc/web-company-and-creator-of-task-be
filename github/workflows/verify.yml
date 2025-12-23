@@ -9,23 +9,93 @@ on:
       taskId:
         description: "Task id"
         required: true
-  push:
-    branches: ["main", "master"]
+      branch:
+        description: "Task branch to verify"
+        required: true
+      checklistKeys:
+        description: "Comma separated checklist keys"
+        required: false
 
 jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout task branch
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
 
-      - name: Show inputs
+      - name: Detect package manager
+        id: pkg
         run: |
-          echo "projectId=${{ github.event.inputs.projectId }}"
-          echo "taskId=${{ github.event.inputs.taskId }}"
+          if [ -f package.json ]; then
+            echo "manager=npm" >> "$GITHUB_OUTPUT"
+          elif [ -f requirements.txt ]; then
+            echo "manager=pip" >> "$GITHUB_OUTPUT"
+          else
+            echo "manager=none" >> "$GITHUB_OUTPUT"
+          fi
 
-      # ✅ aquí pones tu verificación real (tests, lint, build, etc.)
-      - name: Dummy verification
+      - name: Install dependencies (npm)
+        if: steps.pkg.outputs.manager == 'npm'
+        run: npm install
+
+      - name: Install dependencies (pip)
+        if: steps.pkg.outputs.manager == 'pip'
         run: |
-          echo "Running verification..."
-          exit 0
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        id: run_tests
+        continue-on-error: true
+        run: |
+          EXIT_CODE=0
+          if [ "${{ steps.pkg.outputs.manager }}" = "npm" ]; then
+            npm test || EXIT_CODE=$?
+          elif [ "${{ steps.pkg.outputs.manager }}" = "pip" ]; then
+            pytest || EXIT_CODE=$?
+          else
+            echo "No tests detected, skipping"
+            EXIT_CODE=0
+          fi
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+      - name: Publish checklist summary
+        id: summary
+        run: |
+          CHECKS_RESULT="${{ steps.run_tests.outputs.exit_code }}"
+          echo "PROJECT_ID=${{ inputs.projectId }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "TASK_ID=${{ inputs.taskId }}" >> "$GITHUB_STEP_SUMMARY"
+          KEYS_INPUT="${{ inputs.checklistKeys }}"
+          if [ -z "$KEYS_INPUT" ]; then
+            KEYS_INPUT="default"
+          fi
+          IFS=',' read -ra KEYS <<< "$KEYS_INPUT"
+
+          STATUS_ICON="✅"
+          if [ "$CHECKS_RESULT" != "0" ]; then
+            STATUS_ICON="❌"
+          fi
+
+          for KEY in "${KEYS[@]}"; do
+            CLEAN_KEY=$(echo "$KEY" | xargs)
+            if [ -z "$CLEAN_KEY" ]; then
+              continue
+            fi
+            if [ "$STATUS_ICON" = "✅" ]; then
+              echo "- ✅ $CLEAN_KEY | Checks passed" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "- ❌ $CLEAN_KEY | Checks failed" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          if [ "$STATUS_ICON" = "❌" ]; then
+            echo "details=failed" >> "$GITHUB_OUTPUT"
+          else
+            echo "details=passed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fail if tests failed
+        if: steps.run_tests.outputs.exit_code != '0'
+        run: exit 1

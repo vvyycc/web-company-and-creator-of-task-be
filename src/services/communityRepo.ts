@@ -1,3 +1,5 @@
+import fs from "fs";
+import path from "path";
 import { connectMongo } from "../db/mongo";
 import { CommunityProject } from "../models/CommunityProject";
 import { GithubAccount } from "../models/GithubAccount";
@@ -48,6 +50,16 @@ const buildReadmeContent = (title: string, description: string) => {
   const safeTitle = title?.trim() || "Proyecto";
   const safeDescription = description?.trim() || "";
   return `# ${safeTitle}\n\n${safeDescription}\n`;
+};
+
+const getVerifyWorkflowTemplate = () => {
+  const templatePath = path.join(__dirname, "../../github/workflows/verify.yml");
+  try {
+    return fs.readFileSync(templatePath, "utf8");
+  } catch (error) {
+    console.warn("[community:repo] No se pudo leer plantilla verify.yml", error);
+    return null;
+  }
 };
 
 export const isGithubIntegrationPermissionError = (error: any) =>
@@ -138,6 +150,8 @@ export async function createProjectRepo(
   const repoOwnerLogin = createdRepo?.owner?.login ?? ownerAccount.githubLogin;
   const readmeContent = buildReadmeContent(projectTitle, projectDescription);
 
+  const workflowTemplate = getVerifyWorkflowTemplate();
+
   try {
     let sha: string | undefined;
     try {
@@ -163,11 +177,70 @@ export async function createProjectRepo(
     `[community:repo] repo created project=${projectId} repo=${createdRepo?.full_name} owner=${ownerEmail}`
   );
 
+  if (workflowTemplate) {
+    try {
+      await client.createOrUpdateFile(repoOwnerLogin, repoName, ".github/workflows/verify.yml", {
+        message: "Add verify workflow",
+        content: Buffer.from(workflowTemplate, "utf8").toString("base64"),
+      });
+      console.log(
+        `[community:repo] verify workflow added project=${projectId} repo=${createdRepo?.full_name}`
+      );
+    } catch (error) {
+      console.warn(
+        `[community:repo] No se pudo agregar workflow verify.yml project=${projectId} repo=${createdRepo?.full_name}`,
+        error
+      );
+    }
+  }
+
   return {
     name: createdRepo?.name ?? repoName,
     fullName: createdRepo?.full_name ?? `${repoOwnerLogin}/${repoName}`,
     htmlUrl: createdRepo?.html_url,
   };
+}
+
+export async function dispatchVerifyWorkflow(
+  projectId: string,
+  params: { taskId: string; branch: string; checklistKeys?: string[]; workflowNameOrId?: string }
+): Promise<boolean> {
+  const context = await getRepoContext(projectId);
+  const client = createGithubClient(context.ownerToken);
+  const { repoOwner, repoName } = context;
+
+  try {
+    const workflows = await client.listWorkflows(repoOwner, repoName);
+    const workflow = workflows?.workflows?.find((w: any) => {
+      const path = String(w?.path || "");
+      const name = String(w?.name || "");
+      const matchName = params.workflowNameOrId
+        ? String(params.workflowNameOrId).toLowerCase()
+        : "verify";
+      return path.toLowerCase().endsWith("verify.yml") || name.toLowerCase() === matchName;
+    });
+
+    const workflowId = params.workflowNameOrId || workflow?.id || workflow?.path || "verify.yml";
+    const ref = params.branch;
+
+    await client.dispatchWorkflow(repoOwner, repoName, workflowId, ref, {
+      projectId,
+      taskId: params.taskId,
+      branch: params.branch,
+      checklistKeys: params.checklistKeys,
+    });
+
+    console.log(
+      `[community:verify] dispatched project=${projectId} task=${params.taskId} repo=${repoOwner}/${repoName} workflow=${workflowId} ref=${ref}`
+    );
+    return true;
+  } catch (error) {
+    console.warn(
+      `[community:verify] No se pudo disparar workflow project=${projectId} task=${params.taskId}:`,
+      error
+    );
+    return false;
+  }
 }
 
 async function checkRepoMembership(projectId: string, userEmail: string): Promise<RepoMemberStatus> {
