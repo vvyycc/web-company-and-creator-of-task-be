@@ -6,6 +6,7 @@ import { CommunityProject } from "../models/CommunityProject";
 import { getIO } from "../socket";
 import {
   createProjectRepo,
+  dispatchVerifyWorkflow,
   ensureRepoMember,
   inviteUserToRepo,
   isGithubIntegrationPermissionError,
@@ -27,6 +28,14 @@ export type TaskStatus = "TODO" | "IN_PROGRESS" | "IN_REVIEW" | "DONE" | "REJECT
 export type VerificationStatus = "NOT_SUBMITTED" | "SUBMITTED" | "APPROVED" | "REJECTED";
 
 export type RepoCheckStatus = "IDLE" | "PENDING" | "PASSED" | "FAILED";
+
+export type ChecklistStatus = "PENDING" | "PASSED" | "FAILED";
+export type ChecklistItem = {
+  key: string;
+  text: string;
+  status: ChecklistStatus;
+  details?: string;
+};
 
 export type TaskRepo = {
   provider?: "github";
@@ -70,6 +79,7 @@ export interface BoardTask {
   repo?: TaskRepo | null;
   acceptanceCriteria?: string;
   verificationNotes?: string;
+  checklist?: ChecklistItem[];
 }
 
 const router = express.Router();
@@ -129,6 +139,78 @@ function slugifyBranchName(input: string) {
     .slice(0, 60);
 
   return s || "task";
+}
+
+function slugifyChecklistKey(text: string, index: number) {
+  const base = slugifyBranchName(text).slice(0, 40) || "item";
+  return `${base}-${index}`;
+}
+
+function extractChecklistCandidates(acceptanceCriteria?: string, description?: string) {
+  const trimmedAcceptance = String(acceptanceCriteria || "").trim();
+  if (trimmedAcceptance) {
+    const lines = trimmedAcceptance
+      .split(/\r?\n/) // bullet list lines
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith("-") || l.startsWith("*"))
+      .map((l) => l.replace(/^[-*]\s*/, ""))
+      .filter(Boolean);
+    if (lines.length) return lines;
+  }
+
+  const text = String(description || "").trim();
+  if (!text) return [];
+
+  return text
+    .split(/[.;\n]/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .slice(0, 6);
+}
+
+function buildChecklist(task: any): ChecklistItem[] {
+  const candidates = extractChecklistCandidates(task?.acceptanceCriteria, task?.description);
+
+  if (!candidates.length) {
+    return [
+      {
+        key: slugifyChecklistKey(task?.title || "item", 0),
+        text: task?.title || "Checklist",
+        status: "PENDING",
+      },
+    ];
+  }
+
+  return candidates.slice(0, 6).map((text, index) => ({
+    key: slugifyChecklistKey(text, index),
+    text,
+    status: "PENDING" as ChecklistStatus,
+  }));
+}
+
+function normalizeChecklist(task: any): boolean {
+  let changed = false;
+  if (!Array.isArray(task?.checklist) || !task.checklist.length) {
+    task.checklist = buildChecklist(task);
+    changed = true;
+  } else {
+    task.checklist = task.checklist.map((item: any, idx: number) => {
+      const key = item?.key || slugifyChecklistKey(item?.text || `item-${idx}`, idx);
+      const status: ChecklistStatus = ["PENDING", "PASSED", "FAILED"].includes(item?.status)
+        ? (item.status as ChecklistStatus)
+        : "PENDING";
+
+      if (!item?.key || !item?.status) changed = true;
+      return {
+        key,
+        text: item?.text || key,
+        status,
+        ...(item?.details ? { details: item.details } : {}),
+      } as ChecklistItem;
+    });
+  }
+
+  return changed;
 }
 
 async function createBranchFromDefault(
@@ -203,6 +285,10 @@ export function ensureTaskDefaults(task: any): boolean {
     }
   }
 
+  if (normalizeChecklist(task)) {
+    changed = true;
+  }
+
   return changed;
 }
 
@@ -269,6 +355,7 @@ export const mapTaskToBoard = (task: any): BoardTask => {
     repo: task.repo ?? null,
     acceptanceCriteria: task.acceptanceCriteria ?? task.acceptance ?? undefined,
     verificationNotes: task.verificationNotes ?? "",
+    checklist: Array.isArray(task.checklist) ? task.checklist : buildChecklist(task),
   };
 };
 
@@ -341,7 +428,7 @@ router.post(
 
         const columnId = ((t.columnId as ColumnId) ?? "todo") as ColumnId;
 
-        return {
+        const baseTask: any = {
           ...t,
           id,
           columnId,
@@ -363,6 +450,17 @@ router.post(
           acceptanceCriteria: t.acceptanceCriteria ?? t.acceptance ?? undefined,
           verificationNotes: t.verificationNotes ?? "",
         };
+
+        if (!Array.isArray(baseTask.checklist) || !baseTask.checklist.length) {
+          baseTask.checklist = buildChecklist(baseTask);
+          console.log(
+            `[community:checklist] created project=${newId.toString()} task=${id} items=${baseTask.checklist.length}`
+          );
+        } else {
+          normalizeChecklist(baseTask);
+        }
+
+        return baseTask;
       });
 
       const newId = new mongoose.Types.ObjectId();
@@ -952,6 +1050,45 @@ router.post(
         return res.status(400).json({ error: 'Solo se pueden enviar tareas en "Haciendo"' });
       }
 
+      ensureTaskDefaults(task);
+
+      const projectRepoFullName =
+        typeof doc.projectRepo === "string"
+          ? doc.projectRepo
+          : doc.projectRepo?.fullName || doc.projectRepo?.repoFullName || null;
+
+      if (!task.repo) {
+        task.repo = { provider: "github", repoFullName: projectRepoFullName ?? undefined, checks: { status: "IDLE" } };
+      }
+
+      if (!task.repo.repoFullName && projectRepoFullName) {
+        task.repo.repoFullName = projectRepoFullName;
+      }
+
+      if (!task.repo.branch && task.repo.repoFullName) {
+        const baseSlug = slugifyBranchName(task.title || "task");
+        const branchName = `task-${task.id}-${baseSlug}`;
+        try {
+          await createBranchFromDefault(userEmail, task.repo.repoFullName, branchName);
+          task.repo.branch = branchName;
+          console.log(
+            `[community:branch] created project=${id} task=${taskId} repo=${task.repo.repoFullName} branch=${branchName}`
+          );
+        } catch (error) {
+          console.error("[community:branch] create failed on submit-review", {
+            projectId: id,
+            taskId,
+            repo: task.repo.repoFullName,
+            branch: branchName,
+          });
+        }
+      }
+
+      task.repo.checks = task.repo.checks || { status: "IDLE" };
+      task.repo.checks.status = "PENDING";
+      task.repo.checks.lastRunConclusion = null;
+      task.repo.checks.lastRunUrl = undefined;
+
       task.columnId = "review";
       task.status = "IN_REVIEW";
       task.verificationStatus = "SUBMITTED";
@@ -965,6 +1102,17 @@ router.post(
 
       await doc.save();
       emitBoardUpdate(id, tasks);
+
+      const branch = task.repo?.branch;
+      const checklistKeys = (Array.isArray(task.checklist) ? task.checklist : []).map((c: any) => c.key);
+
+      if (branch && task.repo?.repoFullName) {
+        await dispatchVerifyWorkflow(id, {
+          taskId,
+          branch,
+          checklistKeys,
+        });
+      }
 
       return res.status(200).json({ tasks: tasks.map((t) => mapTaskToBoard(t)) });
     } catch (error) {
@@ -1159,6 +1307,8 @@ router.post(
         task.repo.checks = { status: "IDLE" };
       }
       task.repo.checks.status = "PENDING";
+      task.repo.checks.lastRunConclusion = null;
+      task.repo.checks.lastRunUrl = undefined;
 
       task.verificationStatus = "SUBMITTED";
       task.verification = task.verification || { status: "SUBMITTED" };
@@ -1167,48 +1317,31 @@ router.post(
       estimation.tasks = tasks;
       doc.estimation = estimation;
       doc.markModified("estimation");
+
+      if (!task.repo.branch && task.repo.repoFullName) {
+        const baseSlug = slugifyBranchName(task.title || "task");
+        const branchName = `task-${task.id}-${baseSlug}`;
+        try {
+          await createBranchFromDefault(userEmail, task.repo.repoFullName, branchName);
+          task.repo.branch = branchName;
+        } catch (error) {
+          console.error("[community:branch] create failed on run-verify", {
+            projectId: id,
+            taskId,
+            repo: task.repo.repoFullName,
+            branch: branchName,
+          });
+        }
+      }
+
       await doc.save();
 
-      const [owner, repo] = repoFullName.split("/");
-      try {
-        const { client } = await getOctokitForEmail(userEmail);
-
-        await client.getRepo(owner, repo);
-
-        try {
-          const workflows = await client.listWorkflows(owner, repo);
-          const workflow =
-            workflows?.workflows?.find((w: any) => String(w?.path || "").endsWith("verify.yml")) ||
-            workflows?.workflows?.find((w: any) => String(w?.name || "").toLowerCase() === "verify");
-
-          if (workflow?.id) {
-            const repoInfo = await client.getRepo(owner, repo);
-            const ref = repoInfo?.default_branch || "main";
-
-            // ✅ tu wrapper requiere 6 args (incluye projectId y taskId)
-            await client.dispatchWorkflow(owner, repo, workflow.id, ref, id, taskId);
-
-            console.log(
-              `[community:run-verify] workflow dispatch project=${id} task=${taskId} repo=${owner}/${repo} workflow=${workflow.id} ref=${ref}`
-            );
-          } else {
-            console.log(
-              `[community:run-verify] no-workflow project=${id} task=${taskId} repo=${owner}/${repo}`
-            );
-          }
-        } catch (err) {
-          console.warn("[community:run-verify] No se pudo disparar workflow:", err);
-        }
-      } catch (e: any) {
-        console.error("[community:run-verify] GitHub error:", {
-          projectId: id,
+      if (task.repo?.branch) {
+        await dispatchVerifyWorkflow(id, {
           taskId,
-          repoFullName,
-          status: e?.status,
-          message: e?.message,
+          branch: task.repo.branch,
+          checklistKeys: (Array.isArray(task.checklist) ? task.checklist : []).map((c: any) => c.key),
         });
-
-        return res.status(500).json({ error: e?.message || "Error corriendo verificación" });
       }
 
       emitBoardUpdate(id, tasks);

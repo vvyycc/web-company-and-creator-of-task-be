@@ -7,7 +7,7 @@ const router = Router();
 const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 
 // Stripe se utiliza únicamente para cobrar el fee fijo de 30 € por usar el generador de tareas.
-const stripeClient = stripeSecretKey ? new Stripe(stripeSecretKey, { apiVersion: '2025-11-17.clover' }) : null;
+const stripeClient = stripeSecretKey ? new Stripe(stripeSecretKey, { apiVersion: '2025-12-15.clover' }) : null;
 
 router.post('/checkout-session', async (_req: Request, res: Response) => {
   if (!stripeClient) {

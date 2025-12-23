@@ -13,14 +13,18 @@ export type GithubClient = {
 
   listWorkflows: (owner: string, repo: string) => Promise<any>;
 
-  // ✅ IMPORTANTE: mantener firma con 6 args (como te lo pide TS)
   dispatchWorkflow: (
     owner: string,
     repo: string,
     workflowId: number | string,
     ref: string,
-    projectId: string | number,
-    taskId: string | number
+    inputs?: {
+      projectId?: string | number;
+      taskId?: string | number;
+      branch?: string;
+      checklistKeys?: string[];
+      [key: string]: any;
+    }
   ) => Promise<void>;
 
   createRepo: (payload: {
@@ -47,6 +51,15 @@ export type GithubClient = {
   // ✅ NUEVO: refs (ramas)
   getRef: (owner: string, repo: string, ref: string) => Promise<any>;
   createRef: (owner: string, repo: string, ref: string, sha: string) => Promise<any>;
+  mergeBranch: (owner: string, repo: string, base: string, head: string) => Promise<any>;
+  createPullRequest: (
+    owner: string,
+    repo: string,
+    head: string,
+    base: string,
+    title: string,
+    body?: string
+  ) => Promise<any>;
 };
 
 async function githubRequest(token: string, path: string, options: RequestInit = {}): Promise<any> {
@@ -91,23 +104,16 @@ export function createGithubClient(token: string): GithubClient {
       return githubRequest(token, `/repos/${owner}/${repo}/actions/workflows`);
     },
 
-    // ✅ FIX: ahora acepta projectId/taskId (aunque tu workflow no los use, TS lo exige)
-    async dispatchWorkflow(
-      owner: string,
-      repo: string,
-      workflowId: number | string,
-      ref: string,
-      projectId: string | number,
-      taskId: string | number
-    ) {
+    async dispatchWorkflow(owner: string, repo: string, workflowId: number | string, ref: string, inputs) {
+      const normalizedInputs = Object.entries(inputs || {})
+        .filter(([, v]) => v !== undefined && v !== null)
+        .map(([k, v]) => [k, Array.isArray(v) ? v.join(",") : String(v)]);
+
       await githubRequest(token, `/repos/${owner}/${repo}/actions/workflows/${workflowId}/dispatches`, {
         method: "POST",
         body: JSON.stringify({
           ref,
-          inputs: {
-            projectId: String(projectId),
-            taskId: String(taskId),
-          },
+          ...(normalizedInputs.length ? { inputs: Object.fromEntries(normalizedInputs) } : {}),
         }),
       });
     },
@@ -167,6 +173,20 @@ export function createGithubClient(token: string): GithubClient {
       return githubRequest(token, `/repos/${owner}/${repo}/git/refs`, {
         method: "POST",
         body: JSON.stringify({ ref, sha }),
+      });
+    },
+
+    async mergeBranch(owner: string, repo: string, base: string, head: string) {
+      return githubRequest(token, `/repos/${owner}/${repo}/merges`, {
+        method: "POST",
+        body: JSON.stringify({ base, head }),
+      });
+    },
+
+    async createPullRequest(owner: string, repo: string, head: string, base: string, title: string, body?: string) {
+      return githubRequest(token, `/repos/${owner}/${repo}/pulls`, {
+        method: "POST",
+        body: JSON.stringify({ head, base, title, body }),
       });
     },
   };
