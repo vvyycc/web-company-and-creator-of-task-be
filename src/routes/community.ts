@@ -13,6 +13,19 @@ import {
 } from "../services/communityRepo";
 
 import { getOctokitForEmail } from "../services/github";
+import {
+  SPEC_PATH,
+  buildChecklistFromSpec,
+  buildTaskBranchName,
+  commitFileToBranch,
+  detectRepoStack,
+  fetchVerificationSpec,
+  generateVerificationSpec,
+  pollOrFetchLatestRun,
+  translateSpecToTests,
+  triggerWorkflow,
+  ensureWorkflowExists,
+} from "../services/verificationSpec";
 
 export type ColumnId = "todo" | "doing" | "review" | "done";
 
@@ -955,7 +968,7 @@ router.post(
       }
 
       // ─────────────────────────────────────────────
-      // ✅ NUEVO: crear branch al pasar TODO -> DOING
+      // ✅ NUEVO: crear branch y spec al pasar TODO -> DOING
       // ─────────────────────────────────────────────
       ensureTaskDefaults(task);
 
@@ -969,11 +982,11 @@ router.post(
         task.repo.checks = { status: "IDLE" };
       }
 
-      if (!task.repo.branch) {
-        const baseSlug = slugifyBranchName(task.title || "task");
+      const branchName =
+        task.repo.branch ||
+        buildTaskBranchName({ id: String(task.id), title: task.title || task.description || "task" });
 
-        // 🔒 Para evitar colisiones: añade el id
-        const branchName = `task-${task.id}-${baseSlug}`;
+      if (!task.repo.branch) {
         console.log("[community:assign] attempting branch create", {
           projectId: id,
           taskId,
@@ -1019,9 +1032,41 @@ router.post(
             });
             return res.status(500).json({ error: "branch_create_failed" });
           }
-
         }
       }
+
+      // ✅ generar spec y commitear en la rama
+      const spec = generateVerificationSpec({
+        id: String(task.id),
+        title: task.title,
+        description: task.description,
+        acceptanceCriteria: task.acceptanceCriteria,
+      });
+      const specPath = `${SPEC_PATH}/task-${task.id}.json`;
+
+      try {
+        await commitFileToBranch(
+          projectRepoFullName,
+          branchName,
+          specPath,
+          JSON.stringify(spec, null, 2),
+          `chore: add verification spec for task ${task.id}`,
+          doc.ownerEmail
+        );
+      } catch (e: any) {
+        console.error("[community:assign] spec commit failed", {
+          projectId: id,
+          taskId,
+          repo: projectRepoFullName,
+          branch: branchName,
+          message: e?.message,
+          status: e?.status,
+        });
+        return res.status(500).json({ error: "spec_commit_failed" });
+      }
+
+      // checklist basado en spec
+      task.checklist = buildChecklistFromSpec(spec, task.checklist);
 
       // ✅ asignación
       task.assigneeEmail = userEmail;
@@ -1389,7 +1434,7 @@ router.post(
   "/projects/:id/tasks/:taskId/run-verify",
   async (
     req: Request<{ id: string; taskId: string }, unknown, { userEmail?: string }>,
-    res: Response<{ ok: true; tasks: BoardTask[] } | { error: string }>
+    res: Response<{ ok: true; tasks: BoardTask[] } | { error: string } | RepoAccessError>
   ) => {
     try {
       await connectMongo();
@@ -1441,6 +1486,20 @@ router.post(
         return res.status(400).json({ error: "La tarea no tiene repo vinculado" });
       }
 
+      try {
+        const membership = await ensureRepoMember(id, userEmail);
+        if (membership?.state !== "ACTIVE") {
+          return res.status(403).json({
+            error: "repo_access_required",
+            state: membership?.state || "NONE",
+            repoUrl: membership?.repoUrl,
+          });
+        }
+      } catch (error: any) {
+        if (mapRepoErrorToResponse(error, res)) return;
+        throw error;
+      }
+
       if (!task.repo) {
         task.repo = { provider: "github", repoFullName, checks: { status: "IDLE" } };
       }
@@ -1450,21 +1509,11 @@ router.post(
       if (!task.repo.checks) {
         task.repo.checks = { status: "IDLE" };
       }
-      task.repo.checks.status = "PENDING";
-      task.repo.checks.lastRunConclusion = null;
-      task.repo.checks.lastRunUrl = undefined;
-
-      task.verificationStatus = "SUBMITTED";
-      task.verification = task.verification || { status: "SUBMITTED" };
-      task.verification.status = "SUBMITTED";
-
-      estimation.tasks = tasks;
-      doc.estimation = estimation;
-      doc.markModified("estimation");
+      const branchName =
+        task.repo.branch ||
+        buildTaskBranchName({ id: String(task.id), title: task.title || task.description || "task" });
 
       if (!task.repo.branch && task.repo.repoFullName) {
-        const baseSlug = slugifyBranchName(task.title || "task");
-        const branchName = `task-${task.id}-${baseSlug}`;
         try {
           await createBranchFromDefault(doc.ownerEmail, task.repo.repoFullName, branchName);
           task.repo.branch = branchName;
@@ -1478,15 +1527,140 @@ router.post(
         }
       }
 
+      const finalBranch = task.repo.branch || branchName;
+
+      // asegurar spec en rama
+      let spec = await fetchVerificationSpec(repoFullName, finalBranch, String(task.id), doc.ownerEmail);
+      const generatedSpec = generateVerificationSpec({
+        id: String(task.id),
+        title: task.title,
+        description: task.description,
+        acceptanceCriteria: task.acceptanceCriteria,
+      });
+      if (!spec) {
+        spec = generatedSpec;
+      }
+
+      try {
+        await commitFileToBranch(
+          repoFullName,
+          finalBranch,
+          `${SPEC_PATH}/task-${task.id}.json`,
+          JSON.stringify(spec, null, 2),
+          `chore: ensure verification spec for task ${task.id}`,
+          doc.ownerEmail
+        );
+      } catch (error: any) {
+        console.error("[community:run-verify] spec commit failed", {
+          projectId: id,
+          taskId,
+          repo: repoFullName,
+          branch: finalBranch,
+          message: error?.message,
+        });
+        return res.status(500).json({ error: "spec_commit_failed" });
+      }
+
+      // sincroniza checklist
+      task.checklist = buildChecklistFromSpec(spec, task.checklist).map((item) => ({
+        ...item,
+        status: "PENDING" as ChecklistStatus,
+      }));
+
+      task.repo.checks.status = "PENDING";
+      task.repo.checks.lastRunConclusion = null;
+      task.repo.checks.lastRunUrl = undefined;
+
+      task.verificationStatus = "SUBMITTED";
+      task.verification = task.verification || { status: "SUBMITTED" };
+      task.verification.status = "SUBMITTED";
+
+      const stack = await detectRepoStack(repoFullName, finalBranch, doc.ownerEmail);
+      const testFiles = translateSpecToTests(stack, spec);
+
+      try {
+        for (const file of testFiles) {
+          await commitFileToBranch(
+            repoFullName,
+            finalBranch,
+            file.path,
+            file.content,
+            `test: add verification for task ${task.id}`,
+            doc.ownerEmail
+          );
+        }
+        await ensureWorkflowExists(stack, repoFullName, finalBranch, doc.ownerEmail);
+      } catch (error: any) {
+        console.error("[community:run-verify] committing tests/workflow failed", {
+          projectId: id,
+          taskId,
+          repo: repoFullName,
+          branch: finalBranch,
+          message: error?.message,
+        });
+        return res.status(500).json({ error: "verification_setup_failed" });
+      }
+
+      estimation.tasks = tasks;
+      doc.estimation = estimation;
+      doc.markModified("estimation");
       await doc.save();
 
-      if (task.repo?.branch) {
-        await dispatchVerifyWorkflow(id, {
+      try {
+        await triggerWorkflow(
+          repoFullName,
+          finalBranch,
+          { projectId: id, taskId: String(task.id) },
+          doc.ownerEmail
+        );
+      } catch (error: any) {
+        console.error("[community:run-verify] workflow dispatch failed", {
+          projectId: id,
           taskId,
-          branch: task.repo.branch,
-          checklistKeys: (Array.isArray(task.checklist) ? task.checklist : []).map((c: any) => c.key),
+          repo: repoFullName,
+          branch: finalBranch,
+          message: error?.message,
         });
+        return res.status(500).json({ error: "workflow_dispatch_failed" });
       }
+
+      // pequeña espera ligera para permitir creación de run
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      const runInfo = await pollOrFetchLatestRun(repoFullName, finalBranch, doc.ownerEmail);
+      const conclusion = runInfo.conclusion;
+
+      if (conclusion) {
+        const allPassed = conclusion === "success";
+        task.repo.checks.status = allPassed ? "PASSED" : "FAILED";
+        task.repo.checks.lastRunConclusion = conclusion;
+        task.repo.checks.lastRunUrl = runInfo.url;
+
+        task.checklist = task.checklist.map((item: ChecklistItem) => ({
+          ...item,
+          status: allPassed ? "PASSED" : "FAILED",
+        }));
+
+        if (allPassed) {
+          task.columnId = "done";
+          task.status = "DONE";
+          task.verificationStatus = "APPROVED";
+          task.verification = task.verification || { status: "APPROVED" };
+          task.verification.status = "APPROVED";
+        } else {
+          task.columnId = "doing";
+          task.status = "IN_PROGRESS";
+          task.verificationStatus = "REJECTED";
+          task.verification = task.verification || { status: "REJECTED" };
+          task.verification.status = "REJECTED";
+        }
+      } else {
+        task.repo.checks.status = "PENDING";
+      }
+
+      estimation.tasks = tasks;
+      doc.estimation = estimation;
+      doc.markModified("estimation");
+      await doc.save();
 
       emitBoardUpdate(id, tasks);
       return res.status(200).json({ ok: true, tasks: tasks.map((t) => mapTaskToBoard(t)) });
