@@ -25,6 +25,7 @@ export interface GeneratedTask {
 }
 
 export interface ProjectEstimation {
+  id?: string;
   projectTitle: string;
   projectDescription: string;
   ownerEmail: string;
@@ -33,8 +34,12 @@ export interface ProjectEstimation {
   totalTasksPrice: number;
   platformFeePercent: number;
   platformFeeAmount: number;
-  generatorServiceFee: number;
+  generatorServiceFee?: number;
+  generatorFee?: number;
   grandTotalClientCost: number;
+  published?: boolean;
+  projectDurationHours?: number;
+  criticalPathTaskIds?: string[];
 }
 export interface ProjectDocument extends Document {
   ownerEmail: string;

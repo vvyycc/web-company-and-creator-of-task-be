@@ -212,7 +212,48 @@ function normalizeChecklist(task: any): boolean {
 
   return changed;
 }
+async function safeDeleteBranchIfNoCommits(
+  ownerEmail: string,
+  repoFullName: string,
+  branchName: string
+) {
+  const [owner, repo] = String(repoFullName).split("/");
+  if (!owner || !repo) throw new Error("invalid_repo_full_name");
 
+  const { client } = await getOctokitForEmail(ownerEmail);
+
+  // default branch (normalmente main)
+  const repoInfo = await client.getRepo(owner, repo);
+  const base = repoInfo?.default_branch || "main";
+
+  // SHA de main
+  const baseRef = await client.getRef(owner, repo, `heads/${base}`);
+  const baseSha = baseRef?.object?.sha;
+
+  // SHA de la branch
+  let branchRef: any;
+  try {
+    branchRef = await client.getRef(owner, repo, `heads/${branchName}`);
+  } catch (e: any) {
+    // Si no existe ya, ok
+    if (e?.status === 404) return { deleted: false, reason: "branch_not_found" };
+    throw e;
+  }
+
+  const branchSha = branchRef?.object?.sha;
+
+  if (!baseSha || !branchSha) {
+    return { deleted: false, reason: "sha_missing" };
+  }
+
+  // ✅ solo borra si apunta al mismo commit que main
+  if (String(branchSha) !== String(baseSha)) {
+    return { deleted: false, reason: "has_commits" };
+  }
+
+  await client.deleteRef(owner, repo, `heads/${branchName}`);
+  return { deleted: true, reason: "deleted_no_commits" };
+}
 async function createBranchFromDefault(
   userEmail: string,
   repoFullName: string,
@@ -223,11 +264,9 @@ async function createBranchFromDefault(
 
   const { client } = await getOctokitForEmail(userEmail);
 
-  // 1) default branch
   const repoInfo = await client.getRepo(owner, repo);
   const base = repoInfo?.default_branch || "main";
 
-  // 2) SHA de la base branch
   const ref = await client.getRef(owner, repo, `heads/${base}`);
   const sha = ref?.object?.sha;
   if (!sha) {
@@ -236,10 +275,9 @@ async function createBranchFromDefault(
     throw err;
   }
 
-  // 3) crear nueva ref
-  // GitHub requiere "refs/heads/<branch>"
   await client.createRef(owner, repo, `refs/heads/${branchName}`, sha);
-  return { branchName: base, sha };
+
+  return { branchName, sha, baseBranch: base };
 }
 
 
@@ -415,6 +453,9 @@ router.post(
 
       await connectMongo();
 
+      // ✅ IMPORTANTÍSIMO: declara newId ANTES del map
+      const newId = new mongoose.Types.ObjectId();
+
       const tasks: any[] = Array.isArray(estimation?.tasks) ? estimation.tasks : [];
 
       // ✅ normalizamos tasks al publicar (ids válidos y persistidos)
@@ -451,6 +492,7 @@ router.post(
           verificationNotes: t.verificationNotes ?? "",
         };
 
+        // ✅ checklist por tarea (tu lógica actual)
         if (!Array.isArray(baseTask.checklist) || !baseTask.checklist.length) {
           baseTask.checklist = buildChecklist(baseTask);
           console.log(
@@ -463,13 +505,69 @@ router.post(
         return baseTask;
       });
 
-      const newId = new mongoose.Types.ObjectId();
+      // ================================
+      // ✅ NUEVO: TECHNICAL CHECKLIST (PROYECTO)
+      // ================================
+      const buildTechnicalChecklist = (tasksNormalized: any[]) => {
+        const groups: Record<
+          string,
+          { id: string; title: string; layer: string; priority: number; acceptanceCriteria?: string }[]
+        > = {
+          "Arquitectura": [],
+          "Modelo de datos": [],
+          "Servicios / Backend": [],
+          "Vistas / Frontend": [],
+          "Infra / DevOps": [],
+          "QA / Testing": [],
+        };
+
+        for (const t of tasksNormalized) {
+          const layer = String(t.layer ?? t.category ?? "SERVICE");
+          const item = {
+            id: String(t.id ?? ""),
+            title: String(t.title ?? "Tarea"),
+            layer,
+            priority: Number(t.priority ?? 0),
+            acceptanceCriteria: t.acceptanceCriteria ?? undefined,
+          };
+
+          if (layer === "ARCHITECTURE") groups["Arquitectura"].push(item);
+          else if (layer === "MODEL") groups["Modelo de datos"].push(item);
+          else if (layer === "SERVICE") groups["Servicios / Backend"].push(item);
+          else if (layer === "VIEW") groups["Vistas / Frontend"].push(item);
+          else if (layer === "INFRA") groups["Infra / DevOps"].push(item);
+          else if (layer === "QA") groups["QA / Testing"].push(item);
+          else groups["Servicios / Backend"].push(item);
+        }
+
+        // ordenar por prioridad dentro de cada grupo
+        for (const k of Object.keys(groups)) {
+          groups[k].sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
+        }
+
+        // quitar grupos vacíos
+        return Object.entries(groups)
+          .filter(([, items]) => items.length > 0)
+          .map(([title, items]) => ({ title, items }));
+      };
+
+      // ✅ Genera y guarda en estimation (o en root, tu eliges)
+      const technicalChecklist = buildTechnicalChecklist(estimation.tasks);
+
+      // Si quieres guardarlo dentro de estimation:
+      estimation.technicalChecklist = technicalChecklist;
+
+      // (alternativa) si prefieres guardarlo en el root del doc:
+      // const docData: any = { ..., technicalChecklist }
+
+      // ✅ crear doc con el mismo newId
       const doc: any = await CommunityProject.create({
         _id: newId,
         ownerEmail,
         projectTitle,
         projectDescription,
         estimation,
+        technicalChecklist, // ✅ recomendado: root para acceso fácil en listados
         isPublished: true,
       });
 
@@ -516,6 +614,9 @@ router.post(
         platformFeePercent: estimation?.platformFeePercent ?? 1,
         tasksCount: tasksRaw.length,
         publishedAt: doc.createdAt ?? doc.updatedAt,
+
+        // ✅ opcional: si tu evento lo soporta
+        // technicalChecklist,
       });
 
       return res.status(200).json({ id, publicUrl });
@@ -525,6 +626,7 @@ router.post(
     }
   }
 );
+
 
 // ----------------- GET board -----------------
 router.get("/projects/:id/board", async (req: Request<{ id: string }>, res: Response<any>) => {
@@ -880,7 +982,7 @@ router.post(
           userEmail,
         });
         try {
-          await createBranchFromDefault(userEmail, projectRepoFullName, branchName);
+          await createBranchFromDefault(doc.ownerEmail, projectRepoFullName, branchName);
           task.repo.branch = branchName;
 
           console.log(
@@ -986,6 +1088,47 @@ router.post(
         return res.status(400).json({ error: 'Solo se pueden desasignar tareas en "Haciendo"' });
       }
 
+      // ─────────────────────────────────────────────
+      // ✅ OPCIÓN B: borrar rama SOLO si no hay commits
+      // ─────────────────────────────────────────────
+      const repoFullName =
+        task?.repo?.repoFullName ||
+        (typeof doc.projectRepo === "string"
+          ? doc.projectRepo
+          : doc.projectRepo?.fullName || doc.projectRepo?.repoFullName || null);
+
+      const branch = task?.repo?.branch;
+
+      if (repoFullName && branch) {
+        try {
+          const result = await safeDeleteBranchIfNoCommits(doc.ownerEmail, repoFullName, branch);
+
+          console.log("[community:branch] safe delete attempt", {
+            projectId: id,
+            taskId,
+            repoFullName,
+            branch,
+            ...result,
+          });
+
+          // si se borró, limpiamos branch en la tarea
+          if (result.deleted && task.repo) {
+            task.repo.branch = undefined;
+          }
+        } catch (e: any) {
+          console.warn("[community:branch] safe delete failed (ignored)", {
+            projectId: id,
+            taskId,
+            repoFullName,
+            branch,
+            status: e?.status,
+            message: e?.message,
+          });
+          // ❗No rompemos el unassign
+        }
+      }
+
+      // ✅ unassign normal
       task.assigneeEmail = null;
       task.assigneeAvatar = null;
       task.columnId = "todo";
@@ -1006,6 +1149,7 @@ router.post(
     }
   }
 );
+
 
 // ----------------- SUBMIT REVIEW (doing -> review) -----------------
 router.post(
@@ -1069,7 +1213,7 @@ router.post(
         const baseSlug = slugifyBranchName(task.title || "task");
         const branchName = `task-${task.id}-${baseSlug}`;
         try {
-          await createBranchFromDefault(userEmail, task.repo.repoFullName, branchName);
+          await createBranchFromDefault(doc.ownerEmail, task.repo.repoFullName, branchName);
           task.repo.branch = branchName;
           console.log(
             `[community:branch] created project=${id} task=${taskId} repo=${task.repo.repoFullName} branch=${branchName}`
@@ -1322,7 +1466,7 @@ router.post(
         const baseSlug = slugifyBranchName(task.title || "task");
         const branchName = `task-${task.id}-${baseSlug}`;
         try {
-          await createBranchFromDefault(userEmail, task.repo.repoFullName, branchName);
+          await createBranchFromDefault(doc.ownerEmail, task.repo.repoFullName, branchName);
           task.repo.branch = branchName;
         } catch (error) {
           console.error("[community:branch] create failed on run-verify", {

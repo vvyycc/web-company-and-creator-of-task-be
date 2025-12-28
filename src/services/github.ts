@@ -51,6 +51,7 @@ export type GithubClient = {
   // ✅ NUEVO: refs (ramas)
   getRef: (owner: string, repo: string, ref: string) => Promise<any>;
   createRef: (owner: string, repo: string, ref: string, sha: string) => Promise<any>;
+  deleteRef: (owner: string, repo: string, ref: string) => Promise<void>;
   mergeBranch: (owner: string, repo: string, base: string, head: string) => Promise<any>;
   createPullRequest: (
     owner: string,
@@ -175,6 +176,12 @@ export function createGithubClient(token: string): GithubClient {
         body: JSON.stringify({ ref, sha }),
       });
     },
+    async deleteRef(owner: string, repo: string, ref: string) {
+  // ref ejemplo: "heads/mi-rama"
+  await githubRequest(token, `/repos/${owner}/${repo}/git/refs/${encodeURI(ref)}`, {
+    method: "DELETE",
+  });
+},
 
     async mergeBranch(owner: string, repo: string, base: string, head: string) {
       return githubRequest(token, `/repos/${owner}/${repo}/merges`, {

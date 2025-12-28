@@ -32,6 +32,82 @@ export type RepoMemberStatus = {
 
 const GITHUB_PERMISSION_ERROR = "github_permissions_missing";
 
+// ================================
+// ✅ Repo name constraints (GitHub)
+// ================================
+// - max 100 chars
+// - allowed: letters, numbers, hyphens (recommended)
+// - cannot start/end with hyphen
+// - avoid consecutive hyphens
+const MAX_REPO_NAME = 100;
+
+function stripDiacritics(input: string) {
+  return input.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
+function slugifyRepoName(input: string) {
+  const base = stripDiacritics(String(input || ""))
+    .toLowerCase()
+    .trim()
+    // separadores -> guiones
+    .replace(/[\s._/\\]+/g, "-")
+    // quita chars raros (incluye emojis)
+    .replace(/[^a-z0-9-]+/g, "")
+    // colapsa guiones
+    .replace(/-+/g, "-")
+    // quita guiones inicio/fin
+    .replace(/^-+/, "")
+    .replace(/-+$/, "");
+
+  return base;
+}
+
+function safeRepoNameFromTitle(params: {
+  projectTitle: string;
+  projectId?: string; // para unicidad
+  prefix?: string; // opcional
+}) {
+  const { projectTitle, projectId, prefix } = params;
+
+  const slug = slugifyRepoName(projectTitle);
+
+  // sufijo corto para unicidad
+  const shortId = projectId ? String(projectId).slice(-8).toLowerCase() : "";
+  const suffix = shortId ? `-${shortId}` : "";
+
+  const safePrefix = prefix ? `${slugifyRepoName(prefix)}-` : "";
+
+  // recorta slug para que quepa: prefix + slug + suffix <= 100
+  const maxSlugLen = MAX_REPO_NAME - safePrefix.length - suffix.length;
+  const trimmedSlug = (slug || "community-project").slice(0, Math.max(1, maxSlugLen));
+
+  let name = `${safePrefix}${trimmedSlug}${suffix}`;
+
+  // limpieza final
+  name = name.replace(/-+$/g, "").replace(/^-+/g, "");
+  if (!name) name = "community-project";
+
+  // garantía final <= 100
+  if (name.length > MAX_REPO_NAME) {
+    name = name.slice(0, MAX_REPO_NAME).replace(/-+$/g, "");
+  }
+
+  return name;
+}
+
+// ================================
+// ✅ Bonus: descripción segura
+// ================================
+function sanitizeGithubDescription(input?: string): string {
+  if (!input) return "";
+  return input
+    .replace(/[\r\n\t]/g, " ")   // fuera control chars
+    .replace(/\s+/g, " ")        // colapsa espacios
+    .trim()
+    .slice(0, 200);              // ✅ (bonus) límite conservador
+}
+
+// (lo dejo por compatibilidad, pero ya NO se usa para repoName)
 const slugify = (value: string, fallback: string) => {
   const base = value
     .normalize("NFKD")
@@ -113,14 +189,28 @@ export async function createProjectRepo(
     throw new Error("github_not_connected_owner");
   }
 
-  const repoSuffix = projectId.slice(-6).toLowerCase();
-  const repoNameBase = slugify(projectTitle, repoSuffix);
   const client = createGithubClient(ownerAccount.accessToken);
 
+  // ✅ Nombre seguro: <= 100 chars, sin emojis, con sufijo por projectId
+  const repoNameBase = safeRepoNameFromTitle({
+    projectTitle,
+    projectId,
+    prefix: "community", // opcional (puedes quitarlo si no lo quieres)
+  });
+
   let repoName = repoNameBase;
+
+  // ✅ Si ya existe un repo con ese nombre, añade sufijo extra corto (y vuelve a limitar a 100)
   try {
     await client.getRepo(ownerAccount.githubLogin, repoNameBase);
-    repoName = `${repoNameBase}-${repoSuffix}`;
+
+    const extra = projectId.slice(-6).toLowerCase();
+    // añade un segundo sufijo, recortando para no pasarse
+    const tentative = `${repoNameBase}-${extra}`;
+    repoName =
+      tentative.length <= MAX_REPO_NAME
+        ? tentative
+        : tentative.slice(0, MAX_REPO_NAME).replace(/-+$/g, "");
   } catch (error: any) {
     if (error?.status && error.status !== 404) {
       throw error;
@@ -129,9 +219,11 @@ export async function createProjectRepo(
 
   let createdRepo;
   try {
+    const safeDescription = sanitizeGithubDescription(projectDescription);
+
     createdRepo = await client.createRepo({
       name: repoName,
-      description: projectDescription,
+      description: safeDescription,
       private: true,
       auto_init: true,
     });
@@ -313,7 +405,6 @@ async function checkRepoMembership(projectId: string, userEmail: string): Promis
   }
 }
 
-
 export async function ensureRepoMember(projectId: string, userEmail: string) {
   return checkRepoMembership(projectId, userEmail);
 }
@@ -351,11 +442,10 @@ export async function inviteUserToRepo(projectId: string, userEmail: string) {
     `[community:repo] invite sent project=${projectId} user=${userEmail} login=${userAccount.githubLogin}`
   );
 
-return {
-  joined: true,
-  state: "INVITED",
-  repoFullName: context.repoFullName,
-  repoUrl: context.repoUrl,
-};
-
+  return {
+    joined: true,
+    state: "INVITED",
+    repoFullName: context.repoFullName,
+    repoUrl: context.repoUrl,
+  };
 }

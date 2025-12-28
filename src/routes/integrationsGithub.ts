@@ -1,32 +1,81 @@
 import express, { Request, Response } from "express";
 import { connectMongo } from "../db/mongo";
 import { GithubAccount } from "../models/GithubAccount";
-import {
-  exchangeCodeForToken,
-  createGithubClient,
-} from "../services/github";
-
+import { exchangeCodeForToken, createGithubClient } from "../services/github";
 
 const router = express.Router();
 
 const GITHUB_AUTHORIZE_URL = "https://github.com/login/oauth/authorize";
 
 /**
- * ✅ RUTAS FINALES (si montas app.use("/integrations", router)):
- * - GET  /integrations/github/login?userEmail=...&returnTo=...
+ * ✅ RUTAS FINALES (si montas app.use("/integrations/github", router)):
+ * - GET  /integrations/github/login?userEmail=...&returnTo=...&popup=1
  * - GET  /integrations/github/callback?code=...&state=...
  * - GET  /integrations/github/status?userEmail=...
- *
- * - POST /integrations/community/projects/:id/tasks/:taskId/link-repo
- * - POST /integrations/community/projects/:id/tasks/:taskId/run-verify
  */
+
+// -------------------------
+// Helpers
+// -------------------------
+function getFrontendBase() {
+  return process.env.FRONTEND_URL || "http://localhost:3000";
+}
+
+function safeReturnTo(input: unknown, fallback = "/community") {
+  if (typeof input !== "string") return fallback;
+  if (!input.startsWith("/")) return fallback;
+  if (input.startsWith("//")) return fallback; // evita open-redirect
+  return input;
+}
+
+function sendPopupClose(res: Response, payload: any) {
+  const frontendBase = getFrontendBase();
+  const json = JSON.stringify(payload || {});
+
+  const html = `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>GitHub OAuth</title>
+  </head>
+  <body>
+    <script>
+      (function(){
+        var data = ${json};
+        try {
+          if (window.opener && !window.opener.closed) {
+            window.opener.postMessage(data, "${frontendBase}");
+          }
+        } catch (e) {}
+
+        try { window.close(); } catch (e) {}
+
+        // fallback si el navegador bloquea window.close()
+        setTimeout(function(){
+          try {
+            var returnTo = (data && data.returnTo) ? data.returnTo : "/community";
+            var qs = (data && data.qs) ? data.qs : "?github=connected";
+            window.location.href = "${frontendBase}" + returnTo + qs;
+          } catch (e) {
+            window.location.href = "${frontendBase}/community?github=connected";
+          }
+        }, 350);
+      })();
+    </script>
+    <p>Conectando GitHub… Puedes cerrar esta ventana.</p>
+  </body>
+</html>`;
+
+  return res.status(200).setHeader("Content-Type", "text/html").send(html);
+}
 
 // -------------------------
 // GET /github/login
 // -------------------------
 router.get("/login", async (req: Request, res: Response) => {
   const userEmail = (req.query.userEmail as string) || "";
-  const returnTo = (req.query.returnTo as string) || "/community";
+  const returnTo = safeReturnTo(req.query.returnTo, "/community");
+  const popup = String(req.query.popup || "") === "1";
 
   if (!userEmail) return res.status(400).json({ error: "userEmail es obligatorio" });
 
@@ -38,7 +87,7 @@ router.get("/login", async (req: Request, res: Response) => {
   }
 
   const state = Buffer.from(
-    JSON.stringify({ userEmail, returnTo, ts: Date.now() }),
+    JSON.stringify({ userEmail, returnTo, popup, ts: Date.now() }),
     "utf8"
   ).toString("base64url");
 
@@ -55,24 +104,32 @@ router.get("/login", async (req: Request, res: Response) => {
 });
 
 // -------------------------
-// GET /github/callback ✅ FIX DUPLICATE KEY
+// GET /github/callback ✅ FIX DUPLICATE KEY + POPUP MODE
 // -------------------------
 router.get("/callback", async (req: Request, res: Response) => {
-  try {
-    const { code, state } = req.query as { code?: string; state?: string };
-    if (!code) return res.status(400).json({ error: "code es obligatorio" });
-
+  // intentamos recuperar returnTo/popup incluso en error
+  const parseState = () => {
     let userEmail = "";
     let returnTo = "/community";
+    let popup = false;
 
+    const state = String((req.query as any).state || "");
     if (state) {
       try {
         const parsed = JSON.parse(Buffer.from(state, "base64url").toString("utf8"));
         userEmail = parsed.userEmail || "";
-        returnTo = parsed.returnTo || "/community";
+        returnTo = safeReturnTo(parsed.returnTo, "/community");
+        popup = !!parsed.popup;
       } catch {}
     }
+    return { userEmail, returnTo, popup };
+  };
 
+  try {
+    const { code } = req.query as { code?: string; state?: string };
+    if (!code) return res.status(400).json({ error: "code es obligatorio" });
+
+    const { userEmail, returnTo, popup } = parseState();
     if (!userEmail) return res.status(400).json({ error: "userEmail no encontrado en state" });
 
     const token = await exchangeCodeForToken(code, process.env.GITHUB_CALLBACK_URL);
@@ -89,11 +146,19 @@ router.get("/callback", async (req: Request, res: Response) => {
       existingByGithubId &&
       String(existingByGithubId.userEmail).toLowerCase() !== userEmail.toLowerCase()
     ) {
-      const frontendBase = process.env.FRONTEND_URL || "http://localhost:3000";
-      return res.redirect(
-        302,
-        `${frontendBase}${returnTo}?github=conflict&reason=github_already_linked`
-      );
+      const frontendBase = getFrontendBase();
+      const qs = "?github=conflict&reason=github_already_linked";
+
+      if (popup) {
+        return sendPopupClose(res, {
+          github: "conflict",
+          reason: "github_already_linked",
+          returnTo,
+          qs,
+        });
+      }
+
+      return res.redirect(302, `${frontendBase}${returnTo}${qs}`);
     }
 
     // 2) Limpia docs previos para ese userEmail con otro githubUserId (evita inconsistencias)
@@ -111,20 +176,35 @@ router.get("/callback", async (req: Request, res: Response) => {
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
-    const frontendBase = process.env.FRONTEND_URL || "http://localhost:3000";
-    const redirectUrl =
-      `${frontendBase}${returnTo}` +
-      `?github=connected&githubLogin=${encodeURIComponent(user.login)}`;
+    const frontendBase = getFrontendBase();
+    const qs = `?github=connected&githubLogin=${encodeURIComponent(user.login)}`;
 
-    return res.redirect(302, redirectUrl);
+    // ✅ Popup mode: notifica al opener y cierra
+    if (popup) {
+      return sendPopupClose(res, {
+        github: "connected",
+        githubLogin: user.login,
+        returnTo,
+        qs,
+      });
+    }
+
+    // ✅ Normal mode: redirect al frontend
+    return res.redirect(302, `${frontendBase}${returnTo}${qs}`);
   } catch (error) {
     console.error("[github:callback] Error:", error);
-    const frontendBase = process.env.FRONTEND_URL || "http://localhost:3000";
-    return res.redirect(302, `${frontendBase}/community?github=error`);
+
+    const { returnTo, popup } = parseState();
+    const frontendBase = getFrontendBase();
+    const qs = "?github=error";
+
+    if (popup) {
+      return sendPopupClose(res, { github: "error", returnTo, qs });
+    }
+
+    return res.redirect(302, `${frontendBase}${returnTo}${qs}`);
   }
 });
-
-
 
 // -------------------------
 // GET /github/status?userEmail=...
