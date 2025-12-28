@@ -40,13 +40,19 @@ export type GithubClient = {
     owner: string,
     repo: string,
     path: string,
-    payload: { message: string; content: string; sha?: string }
+    payload: { message: string; content: string; sha?: string; branch?: string }
   ) => Promise<any>;
 
   inviteCollaborator: (owner: string, repo: string, username: string) => Promise<any>;
   isCollaborator: (owner: string, repo: string, username: string) => Promise<boolean>;
   listInvitations: (owner: string, repo: string) => Promise<any[]>;
   deleteRepo: (owner: string, repo: string) => Promise<void>;
+  getTree: (owner: string, repo: string, ref: string) => Promise<any>;
+  listWorkflowRuns: (
+    owner: string,
+    repo: string,
+    params?: { branch?: string; workflowId?: string | number; per_page?: number }
+  ) => Promise<any>;
 
   // ✅ NUEVO: refs (ramas)
   getRef: (owner: string, repo: string, ref: string) => Promise<any>;
@@ -161,6 +167,22 @@ export function createGithubClient(token: string): GithubClient {
 
     async deleteRepo(owner: string, repo: string) {
       await githubRequest(token, `/repos/${owner}/${repo}`, { method: "DELETE" });
+    },
+
+    async getTree(owner: string, repo: string, ref: string) {
+      const queryRef = encodeURIComponent(ref);
+      return githubRequest(token, `/repos/${owner}/${repo}/git/trees/${queryRef}?recursive=1`);
+    },
+
+    async listWorkflowRuns(owner: string, repo: string, params) {
+      const searchParams = new URLSearchParams();
+      if (params?.branch) searchParams.set("branch", params.branch);
+      if (params?.per_page) searchParams.set("per_page", String(params.per_page));
+      const basePath = params?.workflowId
+        ? `/repos/${owner}/${repo}/actions/workflows/${params.workflowId}/runs`
+        : `/repos/${owner}/${repo}/actions/runs`;
+      const suffix = searchParams.toString() ? `?${searchParams.toString()}` : "";
+      return githubRequest(token, `${basePath}${suffix}`);
     },
 
     // ✅ NUEVO: getRef / createRef
