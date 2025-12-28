@@ -67,6 +67,12 @@ export type GithubClient = {
     title: string,
     body?: string
   ) => Promise<any>;
+
+  listPullRequests: (
+    owner: string,
+    repo: string,
+    params?: { state?: "open" | "closed" | "all"; head?: string; base?: string; per_page?: number }
+  ) => Promise<any>;
 };
 
 async function githubRequest(token: string, path: string, options: RequestInit = {}): Promise<any> {
@@ -217,6 +223,17 @@ export function createGithubClient(token: string): GithubClient {
         method: "POST",
         body: JSON.stringify({ head, base, title, body }),
       });
+    },
+
+    async listPullRequests(owner: string, repo: string, params) {
+      const searchParams = new URLSearchParams();
+      if (params?.state) searchParams.set("state", params.state);
+      if (params?.head) searchParams.set("head", params.head);
+      if (params?.base) searchParams.set("base", params.base);
+      if (params?.per_page) searchParams.set("per_page", String(params.per_page));
+
+      const suffix = searchParams.toString() ? `?${searchParams.toString()}` : "";
+      return githubRequest(token, `/repos/${owner}/${repo}/pulls${suffix}`);
     },
   };
 }

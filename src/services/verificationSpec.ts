@@ -14,6 +14,12 @@ export type VerificationExpectationType =
   | "security"
   | "unknown";
 
+export type VerificationRule =
+  | { op: "exists"; path: string }
+  | { op: "changed"; path: string }
+  | { op: "contains"; path: string; value: string }
+  | { op: "regex"; path: string; value: string };
+
 export type VerificationExpectation = {
   key: string;
   title: string;
@@ -21,6 +27,7 @@ export type VerificationExpectation = {
   type: VerificationExpectationType;
   target?: string;
   successCriteria?: string[];
+  rules?: VerificationRule[];
 };
 
 export type VerificationSpec = {
@@ -105,6 +112,40 @@ function extractExpectationLines(acceptance?: string, description?: string) {
     .slice(0, 6);
 }
 
+const keywordPathHints: Array<{ match: RegExp; glob: string }> = [
+  { match: /(route|endpoint|api)/i, glob: "src/routes/**/*" },
+  { match: /(service|logic|use case|handler)/i, glob: "src/services/**/*" },
+  { match: /(model|schema|database|db|mongo)/i, glob: "src/models/**/*" },
+  { match: /(socket|websocket)/i, glob: "src/socket.ts" },
+  { match: /(config|env|environment)/i, glob: "src/config/**/*" },
+  { match: /(test|spec|qa)/i, glob: "**/*test*.ts" },
+  { match: /(workflow|pipeline|ci)/i, glob: ".github/workflows/**/*" },
+];
+
+function inferRuleGlob(text: string): string {
+  for (const hint of keywordPathHints) {
+    if (hint.match.test(text)) return hint.glob;
+  }
+  return "src/**/*";
+}
+
+function buildRulesForExpectation(taskId: string, expectationKey: string, text: string): VerificationRule[] {
+  const glob = inferRuleGlob(text);
+  const specPath = path.posix.join(SPEC_DIR, `task-${taskId}.json`);
+
+  const rules: VerificationRule[] = [
+    { op: "changed", path: glob },
+    { op: "exists", path: specPath },
+    {
+      op: "contains",
+      path: specPath,
+      value: `"${expectationKey}"`,
+    },
+  ];
+
+  return rules;
+}
+
 export const generateVerificationSpec = (task: {
   id: string;
   title?: string;
@@ -123,16 +164,19 @@ export const generateVerificationSpec = (task: {
         "Define objective validation for this expectation.",
         "Add implementation that satisfies the acceptance criteria.",
       ],
+      rules: buildRulesForExpectation(task.id, key, text || ""),
     };
   });
 
   if (!expectations.length) {
+    const fallbackKey = `${slugify(task.title || "expectation")}-0`;
     expectations.push({
-      key: `${slugify(task.title || "expectation")}-0`,
+      key: fallbackKey,
       title: task.title || "Expectation",
       description: task.description || "Validate the delivered changes.",
       type: "file",
       successCriteria: ["Verify deliverable matches task description."],
+      rules: buildRulesForExpectation(task.id, fallbackKey, task.description || task.title || ""),
     });
   }
 
@@ -147,19 +191,40 @@ export const generateVerificationSpec = (task: {
   };
 };
 
-export const buildChecklistFromSpec = (spec: VerificationSpec, existing?: ChecklistItem[]) => {
+const describeRule = (rule: VerificationRule): string => {
+  if (!rule) return "";
+  if (rule.op === "exists") return `exists: ${rule.path}`;
+  if (rule.op === "changed") return `changed: ${rule.path}`;
+  if (rule.op === "contains") return `contains: ${rule.path} -> ${rule.value}`;
+  if (rule.op === "regex") return `regex: ${rule.path} /${rule.value}/`;
+  return "";
+};
+
+export const buildChecklistFromSpec = (
+  spec: VerificationSpec,
+  existing?: ChecklistItem[],
+  options?: { forcePending?: boolean; includeRuleDetails?: boolean }
+) => {
   const currentMap = new Map<string, ChecklistItem>();
   (existing || []).forEach((item) => currentMap.set(item.key, item));
 
   return spec.expectations.map((expectation, index) => {
     const prev = currentMap.get(expectation.key);
     const status: ChecklistStatus =
-      prev && ["PENDING", "PASSED", "FAILED"].includes(prev.status) ? prev.status : "PENDING";
+      options?.forcePending || !prev || !["PENDING", "PASSED", "FAILED"].includes(prev.status)
+        ? "PENDING"
+        : (prev.status as ChecklistStatus);
+
+    const detailsFromRules =
+      options?.includeRuleDetails && expectation.rules && expectation.rules.length
+        ? expectation.rules.map((r) => `- ${describeRule(r)}`).join("\n")
+        : expectation.description;
+
     return {
       key: expectation.key || `${slugify(expectation.title, "item")}-${index}`,
       text: expectation.title || expectation.description || expectation.key,
       status,
-      details: expectation.description,
+      ...(detailsFromRules ? { details: detailsFromRules } : {}),
     };
   });
 };
@@ -376,14 +441,15 @@ export const triggerWorkflow = async (
   repoFullName: string,
   branch: string,
   payload: { projectId: string; taskId: string },
-  actorEmail?: string
+  actorEmail?: string,
+  workflowId: string = "verify.yml"
 ) => {
   const [owner, repo] = String(repoFullName).split("/");
   const email = actorEmail || (await resolveOwnerEmailByRepo(repoFullName));
   if (!owner || !repo || !email) throw new Error("invalid_repo_context");
 
   const { client } = await getOctokitForEmail(email);
-  await client.dispatchWorkflow(owner, repo, "verify.yml", branch, {
+  await client.dispatchWorkflow(owner, repo, workflowId, branch, {
     projectId: payload.projectId,
     taskId: payload.taskId,
     branch,
@@ -393,7 +459,8 @@ export const triggerWorkflow = async (
 export const pollOrFetchLatestRun = async (
   repoFullName: string,
   branch: string,
-  actorEmail?: string
+  actorEmail?: string,
+  workflowId: string = "verify.yml"
 ): Promise<{ conclusion: string | null; url?: string }> => {
   const [owner, repo] = String(repoFullName).split("/");
   const email = actorEmail || (await resolveOwnerEmailByRepo(repoFullName));
@@ -401,7 +468,7 @@ export const pollOrFetchLatestRun = async (
 
   const { client } = await getOctokitForEmail(email);
   try {
-    const runs = await client.listWorkflowRuns(owner, repo, { branch, workflowId: "verify.yml", per_page: 5 });
+    const runs = await client.listWorkflowRuns(owner, repo, { branch, workflowId, per_page: 5 });
     const run =
       runs?.workflow_runs?.find((r: any) => String(r.head_branch) === branch) ||
       runs?.workflow_runs?.[0];
@@ -414,3 +481,185 @@ export const pollOrFetchLatestRun = async (
 };
 
 export const SPEC_PATH = SPEC_DIR;
+
+export const buildCommunityVerifyRunner = () =>
+  String.raw`#!/usr/bin/env node
+import { execSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const SPEC_DIR = path.join(process.cwd(), '.community', 'verification');
+
+const args = process.argv.slice(2);
+const taskArg = args.find((a) => a.startsWith('--task='));
+const taskIdFilter = taskArg ? taskArg.replace('--task=', '').trim() : null;
+
+const log = (msg) => console.log(msg);
+
+const safeExec = (command) => {
+  try {
+    return execSync(command, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  } catch (err) {
+    return '';
+  }
+};
+
+const detectBaseRef = () => {
+  const candidates = ['origin/main', 'origin/master', 'main', 'master'];
+  for (const ref of candidates) {
+    try {
+      execSync(\`git rev-parse --verify \${ref}\`, { stdio: 'ignore' });
+      return ref;
+    } catch (e) {
+      // ignore
+    }
+  }
+  return 'origin/main';
+};
+
+const listSpecFiles = () => {
+  if (!fs.existsSync(SPEC_DIR)) return [];
+  return fs.readdirSync(SPEC_DIR)
+    .filter((f) => /^task-.*\\.json$/i.test(f))
+    .map((f) => path.join(SPEC_DIR, f))
+    .filter((f) => (taskIdFilter ? f.includes(\`task-\${taskIdFilter}.json\`) : true));
+};
+
+const describeRule = (rule) => {
+  if (!rule) return '';
+  if (rule.op === 'exists') return \`exists: \${rule.path}\`;
+  if (rule.op === 'changed') return \`changed: \${rule.path}\`;
+  if (rule.op === 'contains') return \`contains: \${rule.path} -> \${rule.value}\`;
+  if (rule.op === 'regex') return \`regex: \${rule.path} /\${rule.value}/\`;
+  return '';
+};
+
+const gitList = (pattern) => {
+  const out = safeExec(\`git ls-files \"\${pattern}\"\`);
+  if (!out) return [];
+  return out.split('\\n').map((l) => l.trim()).filter(Boolean);
+};
+
+const ruleCheckers = {
+  exists: (rule) => {
+    const matches = gitList(rule.path);
+    return { ok: matches.length > 0, details: matches };
+  },
+  changed: (rule) => {
+    const base = detectBaseRef();
+    const out = safeExec(\`git diff --name-only \${base}...HEAD -- \"\${rule.path}\"\`);
+    const files = out ? out.split('\\n').map((l) => l.trim()).filter(Boolean) : [];
+    return { ok: files.length > 0, details: files };
+  },
+  contains: (rule) => {
+    const matches = gitList(rule.path);
+    if (!matches.length) return { ok: false, details: [\`No files match \${rule.path}\`] };
+    const hit = matches.find((file) => {
+      try {
+        const raw = fs.readFileSync(file, 'utf8');
+        return raw.includes(rule.value);
+      } catch (e) {
+        return false;
+      }
+    });
+    return { ok: !!hit, details: hit ? [hit] : [] };
+  },
+  regex: (rule) => {
+    const matches = gitList(rule.path);
+    if (!matches.length) return { ok: false, details: [\`No files match \${rule.path}\`] };
+    const regex = new RegExp(rule.value);
+    const hit = matches.find((file) => {
+      try {
+        const raw = fs.readFileSync(file, 'utf8');
+        return regex.test(raw);
+      } catch (e) {
+        return false;
+      }
+    });
+    return { ok: !!hit, details: hit ? [hit] : [] };
+  },
+};
+
+const evaluateExpectation = (spec, expectation) => {
+  const rules = Array.isArray(expectation.rules) ? expectation.rules : [];
+  if (!rules.length) {
+    return { ok: false, ruleResults: [], message: 'No rules defined' };
+  }
+
+  const ruleResults = rules.map((rule) => {
+    const fn = ruleCheckers[rule.op];
+    if (!fn) return { rule, ok: false, details: ['unsupported rule'] };
+    const result = fn(rule);
+    return { rule, ok: !!result.ok, details: result.details || [] };
+  });
+
+  const ok = ruleResults.every((r) => r.ok);
+  return { ok, ruleResults, message: ok ? 'PASSED' : 'FAILED' };
+};
+
+const evaluateSpec = (specPath) => {
+  const raw = fs.readFileSync(specPath, 'utf8');
+  const spec = JSON.parse(raw);
+  const expectations = Array.isArray(spec.expectations) ? spec.expectations : [];
+
+  const results = expectations.map((expectation) => {
+    const res = evaluateExpectation(spec, expectation);
+    return { expectation, ...res };
+  });
+
+  const ok = results.every((r) => r.ok);
+  return { spec, specPath, ok, results };
+};
+
+const main = () => {
+  const specFiles = listSpecFiles();
+  if (!specFiles.length) {
+    console.error('No verification specs found in .community/verification');
+    process.exit(1);
+  }
+
+  const allResults = specFiles.map((file) => evaluateSpec(file));
+
+  for (const specResult of allResults) {
+    log(\`\\nSpec: \${path.basename(specResult.specPath)} => \${specResult.ok ? 'PASSED' : 'FAILED'}\`);
+    for (const result of specResult.results) {
+      log(\`  - \${result.expectation.key}: \${result.ok ? 'PASSED' : 'FAILED'}\`);
+      result.ruleResults.forEach((rr) => {
+        log(\`      \${rr.ok ? '✔' : '✖'} \${describeRule(rr.rule)}\${rr.details.length ? \` (\${rr.details.join(', ')})\` : ''}\`);
+      });
+      if (!result.ruleResults.length) {
+        log('      ✖ No rules to evaluate');
+      }
+    }
+  }
+
+  const allOk = allResults.every((r) => r.ok);
+  log(\`\\nSummary: \${allOk ? 'PASSED' : 'FAILED'} (\${allResults.filter((r) => r.ok).length}/\${allResults.length} specs)\`);
+  process.exit(allOk ? 0 : 1);
+};
+
+main();
+`;
+
+export const buildCommunityVerifyWorkflow = () => `name: community-verify
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run community verification
+        run: node .community/runner/verify.mjs
+`;
