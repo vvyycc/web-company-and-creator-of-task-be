@@ -3,6 +3,7 @@ import { randomUUID } from "crypto";
 import { GeneratedTask, ProjectEstimation } from "../models/Project";
 import { TaskCategory, TaskComplexity } from "../models/taskTypes";
 import { HOURLY_RATE, PLATFORM_FEE_PERCENT } from "../config/pricing";
+import { DEFAULT_PROJECT_STACK } from "../models/stack";
 
 /* ======================================================
    Types
@@ -404,5 +405,6 @@ export function generateProjectEstimationFromDescription(
     platformFeePercent: PLATFORM_FEE_PERCENT,
     platformFeeAmount,
     grandTotalClientCost: totalTasksPrice + platformFeeAmount,
+    stack: DEFAULT_PROJECT_STACK,
   };
 }

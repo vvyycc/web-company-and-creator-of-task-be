@@ -178,17 +178,32 @@ router.post("/", async (req: Request, res: Response) => {
     }
 
     const allPassed = Array.isArray(task.checklist) && task.checklist.length > 0 && task.checklist.every((c: any) => c.status === "PASSED");
+    const autoApprove = String(process.env.COMMUNITY_AUTO_APPROVE_ON_PASS || "").toLowerCase() === "true";
 
     if (allPassed) {
-      task.columnId = "done";
-      task.status = "DONE";
-      task.verificationStatus = "APPROVED";
-      task.verification = task.verification || { status: "APPROVED" };
-      task.verification.status = "APPROVED";
-      task.verificationNotes = task.verificationNotes || "Auto-approved by verifier";
-      console.log(
-        `[community:auto-done] task moved project=${doc.id} task=${task.id} repo=${task.repo?.repoFullName}`
-      );
+      if (autoApprove) {
+        task.columnId = "done";
+        task.status = "DONE";
+        task.verificationStatus = "APPROVED";
+        task.verification = task.verification || { status: "APPROVED" };
+        task.verification.status = "APPROVED";
+        task.verificationNotes = task.verificationNotes || "Auto-approved by verifier";
+        console.log(
+          `[community:auto-done] task moved project=${doc.id} task=${task.id} repo=${task.repo?.repoFullName}`
+        );
+      } else {
+        task.columnId = "review";
+        task.status = "IN_REVIEW";
+        task.verificationStatus = "SUBMITTED";
+        task.verification = task.verification || { status: "SUBMITTED" };
+        task.verification.status = "SUBMITTED";
+      }
+    } else if (STATUS_FAILURE.has(conclusion)) {
+      task.columnId = "doing";
+      task.status = "IN_PROGRESS";
+      task.verificationStatus = "REJECTED";
+      task.verification = task.verification || { status: "REJECTED" };
+      task.verification.status = "REJECTED";
     } else {
       task.verificationStatus = task.verificationStatus || "SUBMITTED";
       task.verification = task.verification || { status: task.verificationStatus };

@@ -1,6 +1,7 @@
 import { Schema, model, Document } from 'mongoose';
 import { TaskDocument, TaskSchema } from './Task';
 import { TaskCategory, TaskComplexity, ColumnId } from './taskTypes';
+import { DEFAULT_PROJECT_STACK, ProjectStack } from './stack';
 
 
 
@@ -40,6 +41,7 @@ export interface ProjectEstimation {
   published?: boolean;
   projectDurationHours?: number;
   criticalPathTaskIds?: string[];
+  stack?: ProjectStack;
 }
 export interface ProjectDocument extends Document {
   ownerEmail: string;
@@ -53,6 +55,7 @@ export interface ProjectDocument extends Document {
   publishedAt?: Date;
   createdAt: Date;
   updatedAt: Date;
+  stack?: ProjectStack;
 }
 
 const ProjectSchema = new Schema<ProjectDocument>(
@@ -66,6 +69,7 @@ const ProjectSchema = new Schema<ProjectDocument>(
     platformFeePercent: { type: Number, required: true },
     published: { type: Boolean, default: false },
     publishedAt: { type: Date },
+    stack: { type: Schema.Types.Mixed, default: DEFAULT_PROJECT_STACK },
   },
   { timestamps: true }
 );
