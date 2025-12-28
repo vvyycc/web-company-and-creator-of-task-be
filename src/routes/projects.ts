@@ -7,6 +7,8 @@ import { Subscription } from '../models/Subscription';
 import { TaskDocument } from '../models/Task';
 import { emitTaskEvent } from '../services/taskEvents';
 import mongoose from 'mongoose';
+import { generateProjectEstimationFromDescription } from "../services/generateTasks";
+
 
 const router = express.Router();
 
@@ -129,67 +131,63 @@ const formatProject = (project: ProjectDocument) => {
  * Genera un proyecto con tareas troceadas y lo guarda en MongoDB
  */
 router.post(
-  '/generate-tasks',
-  async (
-    req: Request<unknown, unknown, GenerateTasksRequestBody>,
-    res: Response<
-      | { project: ReturnType<typeof formatProject> }
-      | { error: string; message?: string }
-    >
-  ) => {
+  "/generate-tasks",
+  async (req: Request<unknown, unknown, GenerateTasksRequestBody>, res: Response) => {
     try {
-      const {
-        ownerEmail,
-        projectTitle,
-        projectDescription,
-        title,
-        description,
-      } = req.body || {};
+      const { ownerEmail, projectTitle, projectDescription, title, description } = req.body || {};
 
       const resolvedTitle = projectTitle ?? title;
       const resolvedDescription = projectDescription ?? description;
 
       if (!ownerEmail || !resolvedTitle || !resolvedDescription) {
         return res.status(400).json({
-          error:
-            'ownerEmail, projectTitle y projectDescription (o title/description) son obligatorios',
+          error: "ownerEmail, projectTitle y projectDescription (o title/description) son obligatorios",
         });
       }
 
       await connectMongo();
       const subscription = await Subscription.findOne({ email: ownerEmail });
 
-      if (!subscription || subscription.status !== 'active') {
+      if (!subscription || subscription.status !== "active") {
         return res.status(402).json({
-          error: 'subscription_required',
-          message:
-            'Necesitas una suscripción activa de 30 €/mes para generar el troceado de tareas.',
+          error: "subscription_required",
+          message: "Necesitas una suscripción activa de 30 €/mes para generar el troceado de tareas.",
         });
       }
 
-      const tasks = buildSampleTasks(resolvedTitle, resolvedDescription);
-      const totalTasksPrice = tasks.reduce((sum, task) => sum + task.price, 0);
+      // ✅ AQUÍ estaba el mock (buildSampleTasks). Lo cambiamos por el generador real:
+      const estimation = generateProjectEstimationFromDescription({
+        ownerEmail,
+        projectTitle: resolvedTitle,
+        projectDescription: resolvedDescription,
+      });
 
       const project = await ProjectModel.create({
         ownerEmail,
         title: resolvedTitle,
         description: resolvedDescription,
-        tasks,
-        totalTasksPrice,
-        generatorFee: TASK_GENERATOR_FIXED_PRICE_EUR,
-        platformFeePercent: PLATFORM_FEE_PERCENT,
+
+        tasks: estimation.tasks,
+        totalTasksPrice: estimation.totalTasksPrice,
+
+        generatorFee: 0, // lo cobras por suscripción
+        platformFeePercent: estimation.platformFeePercent,
+
+        // Si tu schema no tiene estos campos, bórralos:
+        platformFeeAmount: estimation.platformFeeAmount,
+        grandTotalClientCost: estimation.grandTotalClientCost,
+
         published: false,
       });
 
       return res.status(200).json({ project: formatProject(project) });
     } catch (error) {
-      console.error('Error generando tareas:', error);
-      return res
-        .status(500)
-        .json({ error: 'Error interno al generar tareas' });
+      console.error("Error generando tareas:", error);
+      return res.status(500).json({ error: "Error interno al generar tareas" });
     }
   }
 );
+
 
 /**
  * GET /projects/:id

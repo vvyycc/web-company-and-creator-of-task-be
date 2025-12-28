@@ -6,6 +6,7 @@ import { CommunityProject } from "../models/CommunityProject";
 import { getIO } from "../socket";
 import {
   createProjectRepo,
+  dispatchVerifyWorkflow,
   ensureRepoMember,
   inviteUserToRepo,
   isGithubIntegrationPermissionError,
@@ -27,6 +28,14 @@ export type TaskStatus = "TODO" | "IN_PROGRESS" | "IN_REVIEW" | "DONE" | "REJECT
 export type VerificationStatus = "NOT_SUBMITTED" | "SUBMITTED" | "APPROVED" | "REJECTED";
 
 export type RepoCheckStatus = "IDLE" | "PENDING" | "PASSED" | "FAILED";
+
+export type ChecklistStatus = "PENDING" | "PASSED" | "FAILED";
+export type ChecklistItem = {
+  key: string;
+  text: string;
+  status: ChecklistStatus;
+  details?: string;
+};
 
 export type TaskRepo = {
   provider?: "github";
@@ -70,6 +79,7 @@ export interface BoardTask {
   repo?: TaskRepo | null;
   acceptanceCriteria?: string;
   verificationNotes?: string;
+  checklist?: ChecklistItem[];
 }
 
 const router = express.Router();
@@ -131,6 +141,119 @@ function slugifyBranchName(input: string) {
   return s || "task";
 }
 
+function slugifyChecklistKey(text: string, index: number) {
+  const base = slugifyBranchName(text).slice(0, 40) || "item";
+  return `${base}-${index}`;
+}
+
+function extractChecklistCandidates(acceptanceCriteria?: string, description?: string) {
+  const trimmedAcceptance = String(acceptanceCriteria || "").trim();
+  if (trimmedAcceptance) {
+    const lines = trimmedAcceptance
+      .split(/\r?\n/) // bullet list lines
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith("-") || l.startsWith("*"))
+      .map((l) => l.replace(/^[-*]\s*/, ""))
+      .filter(Boolean);
+    if (lines.length) return lines;
+  }
+
+  const text = String(description || "").trim();
+  if (!text) return [];
+
+  return text
+    .split(/[.;\n]/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .slice(0, 6);
+}
+
+function buildChecklist(task: any): ChecklistItem[] {
+  const candidates = extractChecklistCandidates(task?.acceptanceCriteria, task?.description);
+
+  if (!candidates.length) {
+    return [
+      {
+        key: slugifyChecklistKey(task?.title || "item", 0),
+        text: task?.title || "Checklist",
+        status: "PENDING",
+      },
+    ];
+  }
+
+  return candidates.slice(0, 6).map((text, index) => ({
+    key: slugifyChecklistKey(text, index),
+    text,
+    status: "PENDING" as ChecklistStatus,
+  }));
+}
+
+function normalizeChecklist(task: any): boolean {
+  let changed = false;
+  if (!Array.isArray(task?.checklist) || !task.checklist.length) {
+    task.checklist = buildChecklist(task);
+    changed = true;
+  } else {
+    task.checklist = task.checklist.map((item: any, idx: number) => {
+      const key = item?.key || slugifyChecklistKey(item?.text || `item-${idx}`, idx);
+      const status: ChecklistStatus = ["PENDING", "PASSED", "FAILED"].includes(item?.status)
+        ? (item.status as ChecklistStatus)
+        : "PENDING";
+
+      if (!item?.key || !item?.status) changed = true;
+      return {
+        key,
+        text: item?.text || key,
+        status,
+        ...(item?.details ? { details: item.details } : {}),
+      } as ChecklistItem;
+    });
+  }
+
+  return changed;
+}
+async function safeDeleteBranchIfNoCommits(
+  ownerEmail: string,
+  repoFullName: string,
+  branchName: string
+) {
+  const [owner, repo] = String(repoFullName).split("/");
+  if (!owner || !repo) throw new Error("invalid_repo_full_name");
+
+  const { client } = await getOctokitForEmail(ownerEmail);
+
+  // default branch (normalmente main)
+  const repoInfo = await client.getRepo(owner, repo);
+  const base = repoInfo?.default_branch || "main";
+
+  // SHA de main
+  const baseRef = await client.getRef(owner, repo, `heads/${base}`);
+  const baseSha = baseRef?.object?.sha;
+
+  // SHA de la branch
+  let branchRef: any;
+  try {
+    branchRef = await client.getRef(owner, repo, `heads/${branchName}`);
+  } catch (e: any) {
+    // Si no existe ya, ok
+    if (e?.status === 404) return { deleted: false, reason: "branch_not_found" };
+    throw e;
+  }
+
+  const branchSha = branchRef?.object?.sha;
+
+  if (!baseSha || !branchSha) {
+    return { deleted: false, reason: "sha_missing" };
+  }
+
+  // ✅ solo borra si apunta al mismo commit que main
+  if (String(branchSha) !== String(baseSha)) {
+    return { deleted: false, reason: "has_commits" };
+  }
+
+  await client.deleteRef(owner, repo, `heads/${branchName}`);
+  return { deleted: true, reason: "deleted_no_commits" };
+}
 async function createBranchFromDefault(
   userEmail: string,
   repoFullName: string,
@@ -141,11 +264,9 @@ async function createBranchFromDefault(
 
   const { client } = await getOctokitForEmail(userEmail);
 
-  // 1) default branch
   const repoInfo = await client.getRepo(owner, repo);
   const base = repoInfo?.default_branch || "main";
 
-  // 2) SHA de la base branch
   const ref = await client.getRef(owner, repo, `heads/${base}`);
   const sha = ref?.object?.sha;
   if (!sha) {
@@ -154,10 +275,9 @@ async function createBranchFromDefault(
     throw err;
   }
 
-  // 3) crear nueva ref
-  // GitHub requiere "refs/heads/<branch>"
   await client.createRef(owner, repo, `refs/heads/${branchName}`, sha);
-  return { branchName: base, sha };
+
+  return { branchName, sha, baseBranch: base };
 }
 
 
@@ -201,6 +321,10 @@ export function ensureTaskDefaults(task: any): boolean {
       task.repo.checks.status = "IDLE";
       changed = true;
     }
+  }
+
+  if (normalizeChecklist(task)) {
+    changed = true;
   }
 
   return changed;
@@ -269,6 +393,7 @@ export const mapTaskToBoard = (task: any): BoardTask => {
     repo: task.repo ?? null,
     acceptanceCriteria: task.acceptanceCriteria ?? task.acceptance ?? undefined,
     verificationNotes: task.verificationNotes ?? "",
+    checklist: Array.isArray(task.checklist) ? task.checklist : buildChecklist(task),
   };
 };
 
@@ -328,6 +453,9 @@ router.post(
 
       await connectMongo();
 
+      // ✅ IMPORTANTÍSIMO: declara newId ANTES del map
+      const newId = new mongoose.Types.ObjectId();
+
       const tasks: any[] = Array.isArray(estimation?.tasks) ? estimation.tasks : [];
 
       // ✅ normalizamos tasks al publicar (ids válidos y persistidos)
@@ -341,7 +469,7 @@ router.post(
 
         const columnId = ((t.columnId as ColumnId) ?? "todo") as ColumnId;
 
-        return {
+        const baseTask: any = {
           ...t,
           id,
           columnId,
@@ -363,15 +491,83 @@ router.post(
           acceptanceCriteria: t.acceptanceCriteria ?? t.acceptance ?? undefined,
           verificationNotes: t.verificationNotes ?? "",
         };
+
+        // ✅ checklist por tarea (tu lógica actual)
+        if (!Array.isArray(baseTask.checklist) || !baseTask.checklist.length) {
+          baseTask.checklist = buildChecklist(baseTask);
+          console.log(
+            `[community:checklist] created project=${newId.toString()} task=${id} items=${baseTask.checklist.length}`
+          );
+        } else {
+          normalizeChecklist(baseTask);
+        }
+
+        return baseTask;
       });
 
-      const newId = new mongoose.Types.ObjectId();
+      // ================================
+      // ✅ NUEVO: TECHNICAL CHECKLIST (PROYECTO)
+      // ================================
+      const buildTechnicalChecklist = (tasksNormalized: any[]) => {
+        const groups: Record<
+          string,
+          { id: string; title: string; layer: string; priority: number; acceptanceCriteria?: string }[]
+        > = {
+          "Arquitectura": [],
+          "Modelo de datos": [],
+          "Servicios / Backend": [],
+          "Vistas / Frontend": [],
+          "Infra / DevOps": [],
+          "QA / Testing": [],
+        };
+
+        for (const t of tasksNormalized) {
+          const layer = String(t.layer ?? t.category ?? "SERVICE");
+          const item = {
+            id: String(t.id ?? ""),
+            title: String(t.title ?? "Tarea"),
+            layer,
+            priority: Number(t.priority ?? 0),
+            acceptanceCriteria: t.acceptanceCriteria ?? undefined,
+          };
+
+          if (layer === "ARCHITECTURE") groups["Arquitectura"].push(item);
+          else if (layer === "MODEL") groups["Modelo de datos"].push(item);
+          else if (layer === "SERVICE") groups["Servicios / Backend"].push(item);
+          else if (layer === "VIEW") groups["Vistas / Frontend"].push(item);
+          else if (layer === "INFRA") groups["Infra / DevOps"].push(item);
+          else if (layer === "QA") groups["QA / Testing"].push(item);
+          else groups["Servicios / Backend"].push(item);
+        }
+
+        // ordenar por prioridad dentro de cada grupo
+        for (const k of Object.keys(groups)) {
+          groups[k].sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
+        }
+
+        // quitar grupos vacíos
+        return Object.entries(groups)
+          .filter(([, items]) => items.length > 0)
+          .map(([title, items]) => ({ title, items }));
+      };
+
+      // ✅ Genera y guarda en estimation (o en root, tu eliges)
+      const technicalChecklist = buildTechnicalChecklist(estimation.tasks);
+
+      // Si quieres guardarlo dentro de estimation:
+      estimation.technicalChecklist = technicalChecklist;
+
+      // (alternativa) si prefieres guardarlo en el root del doc:
+      // const docData: any = { ..., technicalChecklist }
+
+      // ✅ crear doc con el mismo newId
       const doc: any = await CommunityProject.create({
         _id: newId,
         ownerEmail,
         projectTitle,
         projectDescription,
         estimation,
+        technicalChecklist, // ✅ recomendado: root para acceso fácil en listados
         isPublished: true,
       });
 
@@ -418,6 +614,9 @@ router.post(
         platformFeePercent: estimation?.platformFeePercent ?? 1,
         tasksCount: tasksRaw.length,
         publishedAt: doc.createdAt ?? doc.updatedAt,
+
+        // ✅ opcional: si tu evento lo soporta
+        // technicalChecklist,
       });
 
       return res.status(200).json({ id, publicUrl });
@@ -427,6 +626,7 @@ router.post(
     }
   }
 );
+
 
 // ----------------- GET board -----------------
 router.get("/projects/:id/board", async (req: Request<{ id: string }>, res: Response<any>) => {
@@ -782,7 +982,7 @@ router.post(
           userEmail,
         });
         try {
-          await createBranchFromDefault(userEmail, projectRepoFullName, branchName);
+          await createBranchFromDefault(doc.ownerEmail, projectRepoFullName, branchName);
           task.repo.branch = branchName;
 
           console.log(
@@ -888,6 +1088,47 @@ router.post(
         return res.status(400).json({ error: 'Solo se pueden desasignar tareas en "Haciendo"' });
       }
 
+      // ─────────────────────────────────────────────
+      // ✅ OPCIÓN B: borrar rama SOLO si no hay commits
+      // ─────────────────────────────────────────────
+      const repoFullName =
+        task?.repo?.repoFullName ||
+        (typeof doc.projectRepo === "string"
+          ? doc.projectRepo
+          : doc.projectRepo?.fullName || doc.projectRepo?.repoFullName || null);
+
+      const branch = task?.repo?.branch;
+
+      if (repoFullName && branch) {
+        try {
+          const result = await safeDeleteBranchIfNoCommits(doc.ownerEmail, repoFullName, branch);
+
+          console.log("[community:branch] safe delete attempt", {
+            projectId: id,
+            taskId,
+            repoFullName,
+            branch,
+            ...result,
+          });
+
+          // si se borró, limpiamos branch en la tarea
+          if (result.deleted && task.repo) {
+            task.repo.branch = undefined;
+          }
+        } catch (e: any) {
+          console.warn("[community:branch] safe delete failed (ignored)", {
+            projectId: id,
+            taskId,
+            repoFullName,
+            branch,
+            status: e?.status,
+            message: e?.message,
+          });
+          // ❗No rompemos el unassign
+        }
+      }
+
+      // ✅ unassign normal
       task.assigneeEmail = null;
       task.assigneeAvatar = null;
       task.columnId = "todo";
@@ -908,6 +1149,7 @@ router.post(
     }
   }
 );
+
 
 // ----------------- SUBMIT REVIEW (doing -> review) -----------------
 router.post(
@@ -952,6 +1194,45 @@ router.post(
         return res.status(400).json({ error: 'Solo se pueden enviar tareas en "Haciendo"' });
       }
 
+      ensureTaskDefaults(task);
+
+      const projectRepoFullName =
+        typeof doc.projectRepo === "string"
+          ? doc.projectRepo
+          : doc.projectRepo?.fullName || doc.projectRepo?.repoFullName || null;
+
+      if (!task.repo) {
+        task.repo = { provider: "github", repoFullName: projectRepoFullName ?? undefined, checks: { status: "IDLE" } };
+      }
+
+      if (!task.repo.repoFullName && projectRepoFullName) {
+        task.repo.repoFullName = projectRepoFullName;
+      }
+
+      if (!task.repo.branch && task.repo.repoFullName) {
+        const baseSlug = slugifyBranchName(task.title || "task");
+        const branchName = `task-${task.id}-${baseSlug}`;
+        try {
+          await createBranchFromDefault(doc.ownerEmail, task.repo.repoFullName, branchName);
+          task.repo.branch = branchName;
+          console.log(
+            `[community:branch] created project=${id} task=${taskId} repo=${task.repo.repoFullName} branch=${branchName}`
+          );
+        } catch (error) {
+          console.error("[community:branch] create failed on submit-review", {
+            projectId: id,
+            taskId,
+            repo: task.repo.repoFullName,
+            branch: branchName,
+          });
+        }
+      }
+
+      task.repo.checks = task.repo.checks || { status: "IDLE" };
+      task.repo.checks.status = "PENDING";
+      task.repo.checks.lastRunConclusion = null;
+      task.repo.checks.lastRunUrl = undefined;
+
       task.columnId = "review";
       task.status = "IN_REVIEW";
       task.verificationStatus = "SUBMITTED";
@@ -965,6 +1246,17 @@ router.post(
 
       await doc.save();
       emitBoardUpdate(id, tasks);
+
+      const branch = task.repo?.branch;
+      const checklistKeys = (Array.isArray(task.checklist) ? task.checklist : []).map((c: any) => c.key);
+
+      if (branch && task.repo?.repoFullName) {
+        await dispatchVerifyWorkflow(id, {
+          taskId,
+          branch,
+          checklistKeys,
+        });
+      }
 
       return res.status(200).json({ tasks: tasks.map((t) => mapTaskToBoard(t)) });
     } catch (error) {
@@ -1159,6 +1451,8 @@ router.post(
         task.repo.checks = { status: "IDLE" };
       }
       task.repo.checks.status = "PENDING";
+      task.repo.checks.lastRunConclusion = null;
+      task.repo.checks.lastRunUrl = undefined;
 
       task.verificationStatus = "SUBMITTED";
       task.verification = task.verification || { status: "SUBMITTED" };
@@ -1167,48 +1461,31 @@ router.post(
       estimation.tasks = tasks;
       doc.estimation = estimation;
       doc.markModified("estimation");
+
+      if (!task.repo.branch && task.repo.repoFullName) {
+        const baseSlug = slugifyBranchName(task.title || "task");
+        const branchName = `task-${task.id}-${baseSlug}`;
+        try {
+          await createBranchFromDefault(doc.ownerEmail, task.repo.repoFullName, branchName);
+          task.repo.branch = branchName;
+        } catch (error) {
+          console.error("[community:branch] create failed on run-verify", {
+            projectId: id,
+            taskId,
+            repo: task.repo.repoFullName,
+            branch: branchName,
+          });
+        }
+      }
+
       await doc.save();
 
-      const [owner, repo] = repoFullName.split("/");
-      try {
-        const { client } = await getOctokitForEmail(userEmail);
-
-        await client.getRepo(owner, repo);
-
-        try {
-          const workflows = await client.listWorkflows(owner, repo);
-          const workflow =
-            workflows?.workflows?.find((w: any) => String(w?.path || "").endsWith("verify.yml")) ||
-            workflows?.workflows?.find((w: any) => String(w?.name || "").toLowerCase() === "verify");
-
-          if (workflow?.id) {
-            const repoInfo = await client.getRepo(owner, repo);
-            const ref = repoInfo?.default_branch || "main";
-
-            // ✅ tu wrapper requiere 6 args (incluye projectId y taskId)
-            await client.dispatchWorkflow(owner, repo, workflow.id, ref, id, taskId);
-
-            console.log(
-              `[community:run-verify] workflow dispatch project=${id} task=${taskId} repo=${owner}/${repo} workflow=${workflow.id} ref=${ref}`
-            );
-          } else {
-            console.log(
-              `[community:run-verify] no-workflow project=${id} task=${taskId} repo=${owner}/${repo}`
-            );
-          }
-        } catch (err) {
-          console.warn("[community:run-verify] No se pudo disparar workflow:", err);
-        }
-      } catch (e: any) {
-        console.error("[community:run-verify] GitHub error:", {
-          projectId: id,
+      if (task.repo?.branch) {
+        await dispatchVerifyWorkflow(id, {
           taskId,
-          repoFullName,
-          status: e?.status,
-          message: e?.message,
+          branch: task.repo.branch,
+          checklistKeys: (Array.isArray(task.checklist) ? task.checklist : []).map((c: any) => c.key),
         });
-
-        return res.status(500).json({ error: e?.message || "Error corriendo verificación" });
       }
 
       emitBoardUpdate(id, tasks);

@@ -1,3 +1,5 @@
+import fs from "fs";
+import path from "path";
 import { connectMongo } from "../db/mongo";
 import { CommunityProject } from "../models/CommunityProject";
 import { GithubAccount } from "../models/GithubAccount";
@@ -30,6 +32,82 @@ export type RepoMemberStatus = {
 
 const GITHUB_PERMISSION_ERROR = "github_permissions_missing";
 
+// ================================
+// ✅ Repo name constraints (GitHub)
+// ================================
+// - max 100 chars
+// - allowed: letters, numbers, hyphens (recommended)
+// - cannot start/end with hyphen
+// - avoid consecutive hyphens
+const MAX_REPO_NAME = 100;
+
+function stripDiacritics(input: string) {
+  return input.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+
+function slugifyRepoName(input: string) {
+  const base = stripDiacritics(String(input || ""))
+    .toLowerCase()
+    .trim()
+    // separadores -> guiones
+    .replace(/[\s._/\\]+/g, "-")
+    // quita chars raros (incluye emojis)
+    .replace(/[^a-z0-9-]+/g, "")
+    // colapsa guiones
+    .replace(/-+/g, "-")
+    // quita guiones inicio/fin
+    .replace(/^-+/, "")
+    .replace(/-+$/, "");
+
+  return base;
+}
+
+function safeRepoNameFromTitle(params: {
+  projectTitle: string;
+  projectId?: string; // para unicidad
+  prefix?: string; // opcional
+}) {
+  const { projectTitle, projectId, prefix } = params;
+
+  const slug = slugifyRepoName(projectTitle);
+
+  // sufijo corto para unicidad
+  const shortId = projectId ? String(projectId).slice(-8).toLowerCase() : "";
+  const suffix = shortId ? `-${shortId}` : "";
+
+  const safePrefix = prefix ? `${slugifyRepoName(prefix)}-` : "";
+
+  // recorta slug para que quepa: prefix + slug + suffix <= 100
+  const maxSlugLen = MAX_REPO_NAME - safePrefix.length - suffix.length;
+  const trimmedSlug = (slug || "community-project").slice(0, Math.max(1, maxSlugLen));
+
+  let name = `${safePrefix}${trimmedSlug}${suffix}`;
+
+  // limpieza final
+  name = name.replace(/-+$/g, "").replace(/^-+/g, "");
+  if (!name) name = "community-project";
+
+  // garantía final <= 100
+  if (name.length > MAX_REPO_NAME) {
+    name = name.slice(0, MAX_REPO_NAME).replace(/-+$/g, "");
+  }
+
+  return name;
+}
+
+// ================================
+// ✅ Bonus: descripción segura
+// ================================
+function sanitizeGithubDescription(input?: string): string {
+  if (!input) return "";
+  return input
+    .replace(/[\r\n\t]/g, " ")   // fuera control chars
+    .replace(/\s+/g, " ")        // colapsa espacios
+    .trim()
+    .slice(0, 200);              // ✅ (bonus) límite conservador
+}
+
+// (lo dejo por compatibilidad, pero ya NO se usa para repoName)
 const slugify = (value: string, fallback: string) => {
   const base = value
     .normalize("NFKD")
@@ -48,6 +126,16 @@ const buildReadmeContent = (title: string, description: string) => {
   const safeTitle = title?.trim() || "Proyecto";
   const safeDescription = description?.trim() || "";
   return `# ${safeTitle}\n\n${safeDescription}\n`;
+};
+
+const getVerifyWorkflowTemplate = () => {
+  const templatePath = path.join(__dirname, "../../github/workflows/verify.yml");
+  try {
+    return fs.readFileSync(templatePath, "utf8");
+  } catch (error) {
+    console.warn("[community:repo] No se pudo leer plantilla verify.yml", error);
+    return null;
+  }
 };
 
 export const isGithubIntegrationPermissionError = (error: any) =>
@@ -101,14 +189,28 @@ export async function createProjectRepo(
     throw new Error("github_not_connected_owner");
   }
 
-  const repoSuffix = projectId.slice(-6).toLowerCase();
-  const repoNameBase = slugify(projectTitle, repoSuffix);
   const client = createGithubClient(ownerAccount.accessToken);
 
+  // ✅ Nombre seguro: <= 100 chars, sin emojis, con sufijo por projectId
+  const repoNameBase = safeRepoNameFromTitle({
+    projectTitle,
+    projectId,
+    prefix: "community", // opcional (puedes quitarlo si no lo quieres)
+  });
+
   let repoName = repoNameBase;
+
+  // ✅ Si ya existe un repo con ese nombre, añade sufijo extra corto (y vuelve a limitar a 100)
   try {
     await client.getRepo(ownerAccount.githubLogin, repoNameBase);
-    repoName = `${repoNameBase}-${repoSuffix}`;
+
+    const extra = projectId.slice(-6).toLowerCase();
+    // añade un segundo sufijo, recortando para no pasarse
+    const tentative = `${repoNameBase}-${extra}`;
+    repoName =
+      tentative.length <= MAX_REPO_NAME
+        ? tentative
+        : tentative.slice(0, MAX_REPO_NAME).replace(/-+$/g, "");
   } catch (error: any) {
     if (error?.status && error.status !== 404) {
       throw error;
@@ -117,9 +219,11 @@ export async function createProjectRepo(
 
   let createdRepo;
   try {
+    const safeDescription = sanitizeGithubDescription(projectDescription);
+
     createdRepo = await client.createRepo({
       name: repoName,
-      description: projectDescription,
+      description: safeDescription,
       private: true,
       auto_init: true,
     });
@@ -137,6 +241,8 @@ export async function createProjectRepo(
 
   const repoOwnerLogin = createdRepo?.owner?.login ?? ownerAccount.githubLogin;
   const readmeContent = buildReadmeContent(projectTitle, projectDescription);
+
+  const workflowTemplate = getVerifyWorkflowTemplate();
 
   try {
     let sha: string | undefined;
@@ -163,11 +269,70 @@ export async function createProjectRepo(
     `[community:repo] repo created project=${projectId} repo=${createdRepo?.full_name} owner=${ownerEmail}`
   );
 
+  if (workflowTemplate) {
+    try {
+      await client.createOrUpdateFile(repoOwnerLogin, repoName, ".github/workflows/verify.yml", {
+        message: "Add verify workflow",
+        content: Buffer.from(workflowTemplate, "utf8").toString("base64"),
+      });
+      console.log(
+        `[community:repo] verify workflow added project=${projectId} repo=${createdRepo?.full_name}`
+      );
+    } catch (error) {
+      console.warn(
+        `[community:repo] No se pudo agregar workflow verify.yml project=${projectId} repo=${createdRepo?.full_name}`,
+        error
+      );
+    }
+  }
+
   return {
     name: createdRepo?.name ?? repoName,
     fullName: createdRepo?.full_name ?? `${repoOwnerLogin}/${repoName}`,
     htmlUrl: createdRepo?.html_url,
   };
+}
+
+export async function dispatchVerifyWorkflow(
+  projectId: string,
+  params: { taskId: string; branch: string; checklistKeys?: string[]; workflowNameOrId?: string }
+): Promise<boolean> {
+  const context = await getRepoContext(projectId);
+  const client = createGithubClient(context.ownerToken);
+  const { repoOwner, repoName } = context;
+
+  try {
+    const workflows = await client.listWorkflows(repoOwner, repoName);
+    const workflow = workflows?.workflows?.find((w: any) => {
+      const path = String(w?.path || "");
+      const name = String(w?.name || "");
+      const matchName = params.workflowNameOrId
+        ? String(params.workflowNameOrId).toLowerCase()
+        : "verify";
+      return path.toLowerCase().endsWith("verify.yml") || name.toLowerCase() === matchName;
+    });
+
+    const workflowId = params.workflowNameOrId || workflow?.id || workflow?.path || "verify.yml";
+    const ref = params.branch;
+
+    await client.dispatchWorkflow(repoOwner, repoName, workflowId, ref, {
+      projectId,
+      taskId: params.taskId,
+      branch: params.branch,
+      checklistKeys: params.checklistKeys,
+    });
+
+    console.log(
+      `[community:verify] dispatched project=${projectId} task=${params.taskId} repo=${repoOwner}/${repoName} workflow=${workflowId} ref=${ref}`
+    );
+    return true;
+  } catch (error) {
+    console.warn(
+      `[community:verify] No se pudo disparar workflow project=${projectId} task=${params.taskId}:`,
+      error
+    );
+    return false;
+  }
 }
 
 async function checkRepoMembership(projectId: string, userEmail: string): Promise<RepoMemberStatus> {
@@ -240,7 +405,6 @@ async function checkRepoMembership(projectId: string, userEmail: string): Promis
   }
 }
 
-
 export async function ensureRepoMember(projectId: string, userEmail: string) {
   return checkRepoMembership(projectId, userEmail);
 }
@@ -278,11 +442,10 @@ export async function inviteUserToRepo(projectId: string, userEmail: string) {
     `[community:repo] invite sent project=${projectId} user=${userEmail} login=${userAccount.githubLogin}`
   );
 
-return {
-  joined: true,
-  state: "INVITED",
-  repoFullName: context.repoFullName,
-  repoUrl: context.repoUrl,
-};
-
+  return {
+    joined: true,
+    state: "INVITED",
+    repoFullName: context.repoFullName,
+    repoUrl: context.repoUrl,
+  };
 }
