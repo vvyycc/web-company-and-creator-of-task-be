@@ -10,6 +10,8 @@ import {
   ensureRepoMember,
   inviteUserToRepo,
   isGithubIntegrationPermissionError,
+  cleanupTaskBranchOnBackToTodo,
+  safeDeleteBranchIfNoCommits 
 } from "../services/communityRepo";
 
 import { getOctokitForEmail } from "../services/github";
@@ -24,6 +26,11 @@ import {
   buildCommunityVerifyWorkflow,
   pollOrFetchLatestRun,
   triggerWorkflow,
+  detectRepoStack,
+  translateSpecToTests,
+  ensureWorkflowExists,
+  RepoStack,
+  ensureVerificationAssetsOnBranch,
 } from "../services/verificationSpec";
 
 export type ColumnId = "todo" | "doing" | "review" | "done";
@@ -259,48 +266,7 @@ function normalizeChecklist(task: any): boolean {
 
   return changed;
 }
-async function safeDeleteBranchIfNoCommits(
-  ownerEmail: string,
-  repoFullName: string,
-  branchName: string
-) {
-  const [owner, repo] = String(repoFullName).split("/");
-  if (!owner || !repo) throw new Error("invalid_repo_full_name");
 
-  const { client } = await getOctokitForEmail(ownerEmail);
-
-  // default branch (normalmente main)
-  const repoInfo = await client.getRepo(owner, repo);
-  const base = repoInfo?.default_branch || "main";
-
-  // SHA de main
-  const baseRef = await client.getRef(owner, repo, `heads/${base}`);
-  const baseSha = baseRef?.object?.sha;
-
-  // SHA de la branch
-  let branchRef: any;
-  try {
-    branchRef = await client.getRef(owner, repo, `heads/${branchName}`);
-  } catch (e: any) {
-    // Si no existe ya, ok
-    if (e?.status === 404) return { deleted: false, reason: "branch_not_found" };
-    throw e;
-  }
-
-  const branchSha = branchRef?.object?.sha;
-
-  if (!baseSha || !branchSha) {
-    return { deleted: false, reason: "sha_missing" };
-  }
-
-  // ✅ solo borra si apunta al mismo commit que main
-  if (String(branchSha) !== String(baseSha)) {
-    return { deleted: false, reason: "has_commits" };
-  }
-
-  await client.deleteRef(owner, repo, `heads/${branchName}`);
-  return { deleted: true, reason: "deleted_no_commits" };
-}
 async function createBranchFromDefault(
   userEmail: string,
   repoFullName: string,
@@ -946,7 +912,6 @@ router.post(
 
       await normalizeAndPersistTaskIds(doc);
 
-      // ✅ si falta repo del proyecto -> no se puede asignar (porque necesitamos crear branch)
       const projectRepoFullName =
         typeof doc.projectRepo === "string"
           ? doc.projectRepo
@@ -959,8 +924,6 @@ router.post(
       // ✅ debe ser miembro/invitado antes de asignar
       try {
         const membership = await ensureRepoMember(id, userEmail);
-
-        // ✅ SOLO si aceptó invitación (ACTIVE) puede asignar/mover
         if (membership?.state !== "ACTIVE") {
           return res.status(403).json({
             error: "repo_access_required",
@@ -968,7 +931,6 @@ router.post(
             repoUrl: membership?.repoUrl,
           });
         }
-
       } catch (error: any) {
         if (mapRepoErrorToResponse(error, res)) return;
         throw error;
@@ -1002,65 +964,37 @@ router.post(
       }
 
       // ─────────────────────────────────────────────
-      // ✅ NUEVO: crear branch y spec al pasar TODO -> DOING
+      // ✅ TODO -> DOING: crear branch + spec + tests + workflow(s)
       // ─────────────────────────────────────────────
       ensureTaskDefaults(task);
 
       if (!task.repo) {
         task.repo = { provider: "github", repoFullName: projectRepoFullName, checks: { status: "IDLE" } };
       }
-      if (!task.repo.repoFullName) {
-        task.repo.repoFullName = projectRepoFullName;
-      }
-      if (!task.repo.checks) {
-        task.repo.checks = { status: "IDLE" };
-      }
+      if (!task.repo.repoFullName) task.repo.repoFullName = projectRepoFullName;
+      if (!task.repo.checks) task.repo.checks = { status: "IDLE" };
 
-      const branchName =
+      const proposedBranch =
         task.repo.branch ||
         buildTaskBranchName({ id: String(task.id), title: task.title || task.description || "task" });
 
+      // 1) Crear rama si no existe (solo una vez)
       if (!task.repo.branch) {
-        console.log("[community:assign] attempting branch create", {
-          projectId: id,
-          taskId,
-          repo: projectRepoFullName,
-          branchName,
-          userEmail,
-        });
         try {
-          await createBranchFromDefault(doc.ownerEmail, projectRepoFullName, branchName);
-          task.repo.branch = branchName;
-
-          console.log(
-            `[community:branch] created project=${id} task=${taskId} repo=${projectRepoFullName} branch=${branchName}`
-          );
+          await createBranchFromDefault(doc.ownerEmail, projectRepoFullName, proposedBranch);
+          task.repo.branch = proposedBranch;
         } catch (e: any) {
-          console.error("[community:branch] create failed", {
-            projectId: id,
-            taskId,
-            repo: projectRepoFullName,
-            branch: branchName,
-            status: e?.status,
-            message: e?.message,
-            responseBody: e?.responseBody,
-          });
           const msg = String(e?.message || "");
           const status = e?.status;
 
           if (msg.includes("Reference already exists") || String(status) === "422") {
-            // ya existe => lo aceptamos y seguimos
-            task.repo.branch = branchName;
-            console.log(
-              `[community:branch] already-exists project=${id} task=${taskId} repo=${projectRepoFullName} branch=${branchName}`
-            );
+            task.repo.branch = proposedBranch;
           } else {
-            // error real
             console.error("[community:branch] create failed", {
               projectId: id,
               taskId,
               repo: projectRepoFullName,
-              branch: branchName,
+              branch: proposedBranch,
               status,
               message: msg,
             });
@@ -1069,64 +1003,58 @@ router.post(
         }
       }
 
-      // ✅ generar spec y commitear en la rama
-      const spec = generateVerificationSpec({
-        id: String(task.id),
-        title: task.title,
-        description: task.description,
-        acceptanceCriteria: task.acceptanceCriteria,
-      });
-      const specPath = `${SPEC_PATH}/task-${task.id}.json`;
+      const branch = String(task.repo.branch || proposedBranch);
 
+      // 2) Crear en la rama: spec + runner + community-workflow + tests autogenerados
+      //    ✅ Usamos helper único para evitar problemas de tipos y “Cannot find name…”
+      let spec: any;
       try {
-        await commitFileToBranch(
-          projectRepoFullName,
-          branchName,
-          specPath,
-          JSON.stringify(spec, null, 2),
-          `chore: add verification spec for task ${task.id}`,
-          doc.ownerEmail
-        );
-        await commitFileToBranch(
-          projectRepoFullName,
-          branchName,
-          ".community/runner/verify.mjs",
-          buildCommunityVerifyRunner(),
-          "chore: ensure community verify runner",
-          doc.ownerEmail
-        );
-        await commitFileToBranch(
-          projectRepoFullName,
-          branchName,
-          ".github/workflows/community-verify.yml",
-          buildCommunityVerifyWorkflow(),
-          "chore: ensure community verify workflow",
-          doc.ownerEmail
-        );
+        const result = await ensureVerificationAssetsOnBranch({
+          repoFullName: projectRepoFullName,
+          branch,
+          task: {
+            id: String(task.id),
+            title: task.title,
+            description: task.description,
+            acceptanceCriteria: task.acceptanceCriteria,
+          },
+          actorEmail: doc.ownerEmail,
+
+          // Si tu generador de tareas ya define stack, pásalo aquí para influir en tests:
+          // stack: (estimation?.stack as RepoStack) || undefined,
+        });
+
+        spec = result.spec;
       } catch (e: any) {
-        console.error("[community:assign] spec commit failed", {
+        console.error("[community:assign] verification assets commit failed", {
           projectId: id,
           taskId,
           repo: projectRepoFullName,
-          branch: branchName,
+          branch,
           message: e?.message,
           status: e?.status,
         });
         return res.status(500).json({ error: "spec_commit_failed" });
       }
 
-      // checklist basado en spec (forzando pending y reglas)
+      // 3) checklist basado en spec (pending)
       task.checklist = buildChecklistFromSpec(spec, task.checklist, {
         forcePending: true,
         includeRuleDetails: true,
       });
 
-      // ✅ asignación
+      // ✅ asignación + estado
       task.assigneeEmail = userEmail;
       task.assigneeAvatar = userAvatar ?? task.assigneeAvatar ?? null;
       task.columnId = "doing";
       task.status = "IN_PROGRESS";
       task.verificationStatus = task.verificationStatus ?? "NOT_SUBMITTED";
+
+      // ✅ checks quedan PENDING hasta que en Review se ejecute run-verify
+      task.repo.checks = task.repo.checks || {};
+      task.repo.checks.status = "PENDING";
+      task.repo.checks.lastRunConclusion = null;
+      task.repo.checks.lastRunUrl = undefined;
 
       estimation.tasks = tasks;
       doc.estimation = estimation;
@@ -1143,6 +1071,8 @@ router.post(
   }
 );
 
+
+
 // ----------------- UNASSIGN (doing -> todo) -----------------
 router.post(
   "/projects/:id/tasks/:taskId/unassign",
@@ -1158,10 +1088,13 @@ router.post(
       await connectMongo();
 
       const doc: any = await CommunityProject.findById(id);
-      if (!doc || !doc.isPublished) return res.status(404).json({ error: "Proyecto no encontrado" });
+      if (!doc || !doc.isPublished) {
+        return res.status(404).json({ error: "Proyecto no encontrado" });
+      }
 
       await normalizeAndPersistTaskIds(doc);
 
+      // 🔐 Permisos repo
       try {
         const membership = await ensureRepoMember(id, userEmail);
         if (!membership?.joined) {
@@ -1178,55 +1111,62 @@ router.post(
       const task = tasks.find((t) => String(t.id) === String(taskId));
       if (!task) return res.status(404).json({ error: "Tarea no encontrada" });
 
+      // 👤 solo el asignado
       if (task.assigneeEmail !== userEmail) {
         return res.status(403).json({ error: "No eres el asignado a esta tarea" });
       }
 
+      // 📌 solo desde doing
       if ((task.columnId ?? "todo") !== "doing") {
         return res.status(400).json({ error: 'Solo se pueden desasignar tareas en "Haciendo"' });
       }
 
       // ─────────────────────────────────────────────
-      // ✅ OPCIÓN B: borrar rama SOLO si no hay commits
+      // ✅ AQUÍ VA EL BORRADO CONDICIONAL DE RAMA
       // ─────────────────────────────────────────────
       const repoFullName =
         task?.repo?.repoFullName ||
         (typeof doc.projectRepo === "string"
           ? doc.projectRepo
-          : doc.projectRepo?.fullName || doc.projectRepo?.repoFullName || null);
+          : doc.projectRepo?.fullName || null);
 
       const branch = task?.repo?.branch;
 
       if (repoFullName && branch) {
         try {
-          const result = await safeDeleteBranchIfNoCommits(doc.ownerEmail, repoFullName, branch);
+          const result = await safeDeleteBranchIfNoCommits(
+            doc.ownerEmail,     // owner del proyecto
+            repoFullName,       // owner/repo
+            branch              // nombre de la rama
+          );
 
-          console.log("[community:branch] safe delete attempt", {
+          console.log("[community:branch] unassign cleanup", {
             projectId: id,
             taskId,
             repoFullName,
             branch,
-            ...result,
+            result,
           });
 
-          // si se borró, limpiamos branch en la tarea
+          // si se borró → limpiamos la rama en la tarea
           if (result.deleted && task.repo) {
             task.repo.branch = undefined;
           }
         } catch (e: any) {
-          console.warn("[community:branch] safe delete failed (ignored)", {
+          // ⚠️ nunca romper el unassign por GitHub
+          console.warn("[community:branch] cleanup skipped", {
             projectId: id,
             taskId,
             repoFullName,
             branch,
-            status: e?.status,
-            message: e?.message,
+            error: e?.message,
           });
-          // ❗No rompemos el unassign
         }
       }
 
-      // ✅ unassign normal
+      // ─────────────────────────────────────────────
+      // ✅ DESASIGNACIÓN NORMAL
+      // ─────────────────────────────────────────────
       task.assigneeEmail = null;
       task.assigneeAvatar = null;
       task.columnId = "todo";
@@ -1240,13 +1180,17 @@ router.post(
       await doc.save();
       emitBoardUpdate(id, tasks);
 
-      return res.status(200).json({ tasks: tasks.map((t) => mapTaskToBoard(t)) });
+      return res.status(200).json({
+        tasks: tasks.map((t) => mapTaskToBoard(t)),
+      });
     } catch (error) {
       console.error("[community] Error desasignando tarea:", error);
       return res.status(500).json({ error: "Error interno desasignando tarea" });
     }
   }
 );
+
+
 
 
 // ----------------- SUBMIT REVIEW (doing -> review) -----------------
@@ -1539,6 +1483,7 @@ router.post(
         return res.status(400).json({ error: "La tarea no tiene repo vinculado" });
       }
 
+      // ✅ debe ser miembro ACTIVE
       try {
         const membership = await ensureRepoMember(id, userEmail);
         if (membership?.state !== "ACTIVE") {
@@ -1562,10 +1507,12 @@ router.post(
       if (!task.repo.checks) {
         task.repo.checks = { status: "IDLE" };
       }
+
       const branchName =
         task.repo.branch ||
         buildTaskBranchName({ id: String(task.id), title: task.title || task.description || "task" });
 
+      // Si no existe branch, intentamos crear (pero sin romper si ya existe)
       if (!task.repo.branch && task.repo.repoFullName) {
         try {
           await createBranchFromDefault(doc.ownerEmail, task.repo.repoFullName, branchName);
@@ -1582,7 +1529,9 @@ router.post(
 
       const finalBranch = task.repo.branch || branchName;
 
-      // asegurar spec en rama
+      // ─────────────────────────────────────────────
+      // ✅ 1) Asegurar SPEC en rama de tarea
+      // ─────────────────────────────────────────────
       let spec = await fetchVerificationSpec(repoFullName, finalBranch, String(task.id), doc.ownerEmail);
       const generatedSpec = generateVerificationSpec({
         id: String(task.id),
@@ -1590,9 +1539,7 @@ router.post(
         description: task.description,
         acceptanceCriteria: task.acceptanceCriteria,
       });
-      if (!spec) {
-        spec = generatedSpec;
-      }
+      if (!spec) spec = generatedSpec;
 
       try {
         await commitFileToBranch(
@@ -1614,12 +1561,15 @@ router.post(
         return res.status(500).json({ error: "spec_commit_failed" });
       }
 
-      // checklist y setup runner/workflow
+      // Checklist (se queda en pending antes de correr)
       task.checklist = buildChecklistFromSpec(spec, task.checklist, {
         forcePending: true,
         includeRuleDetails: true,
       });
 
+      // ─────────────────────────────────────────────
+      // ✅ 2) Asegurar runner en rama de tarea
+      // ─────────────────────────────────────────────
       try {
         await commitFileToBranch(
           repoFullName,
@@ -1629,16 +1579,8 @@ router.post(
           "chore: ensure community verify runner",
           doc.ownerEmail
         );
-        await commitFileToBranch(
-          repoFullName,
-          finalBranch,
-          COMMUNITY_WORKFLOW_FILE,
-          buildCommunityVerifyWorkflow(),
-          "chore: ensure community verify workflow",
-          doc.ownerEmail
-        );
       } catch (error: any) {
-        console.error("[community:run-verify] committing verification assets failed", {
+        console.error("[community:run-verify] runner commit failed", {
           projectId: id,
           taskId,
           repo: repoFullName,
@@ -1648,6 +1590,96 @@ router.post(
         return res.status(500).json({ error: "verification_setup_failed" });
       }
 
+      // ─────────────────────────────────────────────
+      // ✅ 3) Asegurar workflow DISPATCH en default branch (main/master)
+      //     (NO en la rama de la tarea)
+      // ─────────────────────────────────────────────
+      const DISPATCH_WORKFLOW_ID = "verify.yml";
+      const DISPATCH_WORKFLOW_PATH = ".github/workflows/verify.yml";
+
+      const buildVerifyDispatchWorkflow = () => `name: verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      projectId:
+        description: "Community project id"
+        required: true
+      taskId:
+        description: "Task id"
+        required: true
+      branch:
+        description: "Task branch to verify"
+        required: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout task branch
+        uses: actions/checkout@v4
+        with:
+          ref: \${{ inputs.branch }}
+          fetch-depth: 0
+
+      - name: Fetch base refs (origin/main or origin/master)
+        run: |
+          git remote -v
+          git fetch origin main:refs/remotes/origin/main || true
+          git fetch origin master:refs/remotes/origin/master || true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run community verification
+        run: node .community/runner/verify.mjs --task=\${{ inputs.taskId }}
+`;
+
+      const ensureWorkflowOnDefaultBranch = async () => {
+        const content = buildVerifyDispatchWorkflow();
+
+        // Probamos main -> master
+        const candidates = ["main", "master"];
+        let lastErr: any = null;
+
+        for (const baseBranch of candidates) {
+          try {
+            await commitFileToBranch(
+              repoFullName,
+              baseBranch,
+              DISPATCH_WORKFLOW_PATH,
+              content,
+              "chore: ensure verify workflow",
+              doc.ownerEmail
+            );
+            return;
+          } catch (e: any) {
+            lastErr = e;
+          }
+        }
+
+        console.error("[community:run-verify] cannot ensure dispatch workflow on default branch", {
+          repo: repoFullName,
+          message: lastErr?.message,
+          status: lastErr?.status,
+        });
+        throw new Error("workflow_missing_in_default_branch");
+      };
+
+      try {
+        await ensureWorkflowOnDefaultBranch();
+      } catch (e: any) {
+        return res.status(500).json({
+          error:
+            e?.message === "workflow_missing_in_default_branch"
+              ? "workflow_missing_in_default_branch"
+              : "verification_setup_failed",
+        });
+      }
+
+      // Marcar estado submitted/pending
       task.repo.checks.status = "PENDING";
       task.repo.checks.lastRunConclusion = null;
       task.repo.checks.lastRunUrl = undefined;
@@ -1656,39 +1688,22 @@ router.post(
       task.verification = task.verification || { status: "SUBMITTED" };
       task.verification.status = "SUBMITTED";
 
-      try {
-        const prInfo = await ensurePullRequestForBranch({
-          ownerEmail: doc.ownerEmail,
-          repoFullName,
-          branchName: finalBranch,
-          title: `Verify task ${task.id}`,
-          body: `Auto-generated PR to run community verification for task ${task.id}.`,
-        });
-        if (task.repo) {
-          task.repo.prNumber = prInfo.number ?? task.repo.prNumber;
-        }
-      } catch (error: any) {
-        console.error("[community:run-verify] ensure PR failed", {
-          projectId: id,
-          taskId,
-          repo: repoFullName,
-          branch: finalBranch,
-          message: error?.message,
-        });
-      }
-
+      // Guardar antes de dispatch
       estimation.tasks = tasks;
       doc.estimation = estimation;
       doc.markModified("estimation");
       await doc.save();
 
+      // ─────────────────────────────────────────────
+      // ✅ 4) DISPATCH del workflow correcto (verify.yml)
+      // ─────────────────────────────────────────────
       try {
         await triggerWorkflow(
           repoFullName,
-          finalBranch,
+          finalBranch, // ref para dispatch (tu helper lo usa también en inputs)
           { projectId: id, taskId: String(task.id) },
           doc.ownerEmail,
-          "community-verify.yml"
+          DISPATCH_WORKFLOW_ID
         );
       } catch (error: any) {
         console.error("[community:run-verify] workflow dispatch failed", {
@@ -1701,14 +1716,10 @@ router.post(
         return res.status(500).json({ error: "workflow_dispatch_failed" });
       }
 
-      // pequeña espera ligera para permitir creación de run
-      await new Promise((resolve) => setTimeout(resolve, 1200));
-      const runInfo = await pollOrFetchLatestRun(
-        repoFullName,
-        finalBranch,
-        doc.ownerEmail,
-        "community-verify.yml"
-      );
+      // pequeña espera para permitir creación de run
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+
+      const runInfo = await pollOrFetchLatestRun(repoFullName, finalBranch, doc.ownerEmail, DISPATCH_WORKFLOW_ID);
       const conclusion = runInfo.conclusion;
 
       if (conclusion) {
@@ -1717,7 +1728,7 @@ router.post(
         task.repo.checks.lastRunConclusion = conclusion;
         task.repo.checks.lastRunUrl = runInfo.url;
 
-        task.checklist = task.checklist.map((item: ChecklistItem) => ({
+        task.checklist = (task.checklist || []).map((item: ChecklistItem) => ({
           ...item,
           status: allPassed ? "PASSED" : "FAILED",
         }));
@@ -1728,9 +1739,7 @@ router.post(
           task.verificationStatus = "APPROVED";
           task.verification = task.verification || { status: "APPROVED" };
           task.verification.status = "APPROVED";
-          task.verificationNotes = runInfo.url
-            ? `Verificación aprobada. Run: ${runInfo.url}`
-            : "Verificación aprobada.";
+          task.verificationNotes = runInfo.url ? `Verificación aprobada. Run: ${runInfo.url}` : "Verificación aprobada.";
         } else {
           task.columnId = "doing";
           task.status = "IN_PROGRESS";
@@ -1758,5 +1767,6 @@ router.post(
     }
   }
 );
+
 
 export default router;

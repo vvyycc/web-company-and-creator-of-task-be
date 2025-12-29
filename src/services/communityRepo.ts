@@ -19,6 +19,9 @@ type RepoContext = {
   repoUrl: string;
   ownerEmail: string;
   ownerToken: string;
+
+  // ✅ NUEVO: para decidir si un commit es del owner
+  ownerGithubLogin: string;
 };
 
 export type RepoMemberState = "NONE" | "INVITED" | "ACTIVE";
@@ -61,7 +64,17 @@ function slugifyRepoName(input: string) {
 
   return base;
 }
+function parseRepoFullName(repoFullName: string): { owner: string; repo: string } {
+  const [owner, repo] = String(repoFullName || "").split("/");
+  if (!owner || !repo) throw new Error("invalid_repo_full_name");
+  return { owner, repo };
+}
 
+function isOwnerOrBotLogin(login: unknown, ownerLogin: string) {
+  const l = String(login || "").toLowerCase();
+  if (!l) return false;
+  return l === String(ownerLogin || "").toLowerCase() || BOT_LOGINS.has(l);
+}
 function safeRepoNameFromTitle(params: {
   projectTitle: string;
   projectId?: string; // para unicidad
@@ -107,7 +120,7 @@ function sanitizeGithubDescription(input?: string): string {
     .slice(0, 200);              // ✅ (bonus) límite conservador
 }
 
-// (lo dejo por compatibilidad, pero ya NO se usa para repoName)
+// (compat, pero ya NO se usa para repoName)
 const slugify = (value: string, fallback: string) => {
   const base = value
     .normalize("NFKD")
@@ -174,6 +187,7 @@ async function getRepoContext(projectId: string): Promise<RepoContext> {
     repoUrl,
     ownerEmail: project.ownerEmail,
     ownerToken: ownerAccount.accessToken,
+    ownerGithubLogin: ownerAccount.githubLogin || "",
   };
 }
 
@@ -191,21 +205,20 @@ export async function createProjectRepo(
 
   const client = createGithubClient(ownerAccount.accessToken);
 
-  // ✅ Nombre seguro: <= 100 chars, sin emojis, con sufijo por projectId
+  // ✅ Nombre seguro
   const repoNameBase = safeRepoNameFromTitle({
     projectTitle,
     projectId,
-    prefix: "community", // opcional (puedes quitarlo si no lo quieres)
+    prefix: "community", // opcional
   });
 
   let repoName = repoNameBase;
 
-  // ✅ Si ya existe un repo con ese nombre, añade sufijo extra corto (y vuelve a limitar a 100)
+  // ✅ Si ya existe, añade sufijo extra (sin pasarte de 100)
   try {
     await client.getRepo(ownerAccount.githubLogin, repoNameBase);
 
     const extra = projectId.slice(-6).toLowerCase();
-    // añade un segundo sufijo, recortando para no pasarse
     const tentative = `${repoNameBase}-${extra}`;
     repoName =
       tentative.length <= MAX_REPO_NAME
@@ -448,4 +461,211 @@ export async function inviteUserToRepo(projectId: string, userEmail: string) {
     repoFullName: context.repoFullName,
     repoUrl: context.repoUrl,
   };
+}
+
+// =====================================================
+// ✅ NUEVO: Cleanup de rama al volver doing -> todo
+// =====================================================
+// Regla:
+// - Si no hay commits ahead del base -> borrar rama
+// - Si hay commits y TODOS son owner o bots -> borrar rama
+// - Si hay commits de otro usuario -> NO borrar
+const BOT_LOGINS = new Set<string>([
+  "github-actions[bot]",
+  "github-actions",
+  "dependabot[bot]",
+]);
+
+export async function cleanupTaskBranchOnBackToTodo(params: {
+  projectId: string;
+  taskBranch: string;
+  baseBranch?: string;
+}): Promise<{ deleted: boolean; reason: string }> {
+  const context = await getRepoContext(params.projectId);
+  const client: any = createGithubClient(context.ownerToken);
+
+  const repoOwner = context.repoOwner;
+  const repoName = context.repoName;
+
+  const branch = String(params.taskBranch || "").trim();
+  if (!branch) return { deleted: false, reason: "no_branch" };
+
+  // 1) base branch
+    // Nunca borrar la rama default
+  let defaultBranch = "main";
+  try {
+    const repo = await client.getRepo(repoOwner, repoName);
+    defaultBranch = repo?.default_branch || "main";
+  } catch {}
+
+  if (branch === defaultBranch) return { deleted: false, reason: "branch_is_base" };
+
+  // 2) si la rama no existe, no hacemos nada
+  try {
+    // wrapper debería tener getRef; si no, esto puede fallar
+    await client.getRef?.(repoOwner, repoName, `heads/${branch}`);
+  } catch (e: any) {
+    if (e?.status === 404) return { deleted: false, reason: "branch_not_found" };
+    // si no existe getRef, seguimos (pero en ese caso deleteRef también puede faltar)
+  }
+
+  // 3) comparar base...branch
+ try {
+    await client.getRef?.(repoOwner, repoName, `heads/${branch}`);
+  } catch (e: any) {
+    if (e?.status === 404) return { deleted: false, reason: "branch_not_found" };
+    // si falla por otro motivo, no rompemos
+    return { deleted: false, reason: "cannot_get_ref" };
+  }
+
+  const ownerLogin = String(context.ownerGithubLogin || "").toLowerCase();
+  const isOwnerOrBot = (login?: string | null) => {
+    const l = String(login || "").toLowerCase();
+    if (!l) return false;
+    return l === ownerLogin || BOT_LOGINS.has(l);
+  };
+
+  // 2) Listar commits del branch (últimos 30)
+  let commits: any[] = [];
+  try {
+    const list = await client.listCommits?.(repoOwner, repoName, { sha: branch, per_page: 30 });
+    commits = Array.isArray(list) ? list : Array.isArray(list?.data) ? list.data : [];
+  } catch {
+    // si no podemos listar commits, no borramos por seguridad
+    return { deleted: false, reason: "cannot_list_commits" };
+  }
+
+  // Caso: branch recién creada pero sin commits “útiles”
+  if (!commits.length) {
+    try {
+      await client.deleteRef?.(repoOwner, repoName, `heads/${branch}`);
+      return { deleted: true, reason: "no_commits" };
+    } catch {
+      return { deleted: false, reason: "delete_ref_not_available" };
+    }
+  }
+
+  // 3) Si hay algún commit de otro user -> NO borrar
+  const hasNonOwnerCommit = commits.some((c: any) => {
+    const authorLogin = c?.author?.login ?? null;
+    const committerLogin = c?.committer?.login ?? null;
+
+    // Si ninguno es owner/bot -> otro user
+    const ok = isOwnerOrBot(authorLogin) || isOwnerOrBot(committerLogin);
+    return !ok;
+  });
+
+  if (hasNonOwnerCommit) {
+    return { deleted: false, reason: "has_commits_by_non_owner" };
+  }
+
+  // 4) Solo owner/bots -> borrar
+  try {
+    await client.deleteRef?.(repoOwner, repoName, `heads/${branch}`);
+    return { deleted: true, reason: "only_owner_or_bots_commits" };
+  } catch {
+    return { deleted: false, reason: "delete_ref_not_available" };
+  }
+
+ 
+
+}
+ export async function safeDeleteBranchIfNoCommits(
+  ownerEmail: string,              // owner del proyecto (para token)
+  repoFullName: string,            // "owner/repo"
+  branch: string                   // "task-xxx"
+): Promise<{ deleted: boolean; reason: string }> {
+  const { owner, repo } = parseRepoFullName(repoFullName);
+  const b = String(branch || "").trim();
+  if (!b) return { deleted: false, reason: "no_branch" };
+
+  await connectMongo();
+  const ownerAccount = await GithubAccount.findOne({ userEmail: ownerEmail }).lean();
+  if (!ownerAccount?.accessToken) return { deleted: false, reason: "github_not_connected_owner" };
+
+  const client: any = createGithubClient(ownerAccount.accessToken);
+
+  // 0) repo info + default branch
+  let defaultBranch = "main";
+  try {
+    const repoInfo = await client.getRepo(owner, repo);
+    defaultBranch = repoInfo?.default_branch || "main";
+  } catch {
+    // si no podemos leer repo, no borramos por seguridad
+    return { deleted: false, reason: "cannot_get_repo" };
+  }
+
+  if (b === defaultBranch) return { deleted: false, reason: "branch_is_default" };
+
+  // 1) si el ref no existe, no hacemos nada
+  try {
+    await client.getRef(owner, repo, `heads/${b}`);
+  } catch (e: any) {
+    if (e?.status === 404) return { deleted: false, reason: "branch_not_found" };
+    return { deleted: false, reason: "cannot_get_branch_ref" };
+  }
+
+  // 2) obtener HEAD commit sha del branch y del default (con listCommits per_page=1)
+  const normalizeList = (raw: any) => (Array.isArray(raw) ? raw : Array.isArray(raw?.data) ? raw.data : []);
+
+  let branchCommits: any[] = [];
+  let defaultCommits: any[] = [];
+
+  try {
+    branchCommits = normalizeList(await client.listCommits(owner, repo, { sha: b, per_page: 1 }));
+    defaultCommits = normalizeList(await client.listCommits(owner, repo, { sha: defaultBranch, per_page: 1 }));
+  } catch {
+    return { deleted: false, reason: "cannot_list_commits" };
+  }
+
+  const branchHeadSha = branchCommits?.[0]?.sha ? String(branchCommits[0].sha) : "";
+  const defaultHeadSha = defaultCommits?.[0]?.sha ? String(defaultCommits[0].sha) : "";
+
+  if (!branchHeadSha || !defaultHeadSha) {
+    return { deleted: false, reason: "missing_head_sha" };
+  }
+
+  // ✅ Regla 1 (real “sin cambios”): si HEAD del branch == HEAD del default => no hay commits propios
+  const hasOwnChanges = branchHeadSha !== defaultHeadSha;
+
+  // ✅ Regla 2 (tu regla): si hay cambios, solo borramos si NO hay commits de no-owner
+  // (en este caso necesitamos mirar algunos commits del branch)
+  if (hasOwnChanges) {
+    // miramos últimos 20 para detectar autor no-owner (suficiente en la práctica)
+    let recent: any[] = [];
+    try {
+      recent = normalizeList(await client.listCommits(owner, repo, { sha: b, per_page: 20 }));
+    } catch {
+      return { deleted: false, reason: "cannot_list_recent_commits" };
+    }
+
+    const ownerLogin = String(ownerAccount.githubLogin || "").toLowerCase();
+
+    const hasNonOwnerCommit = recent.some((c: any) => {
+      const authorLogin = c?.author?.login ?? null;
+      const committerLogin = c?.committer?.login ?? null;
+
+      const ok =
+        isOwnerOrBotLogin(authorLogin, ownerLogin) ||
+        isOwnerOrBotLogin(committerLogin, ownerLogin);
+
+      return !ok;
+    });
+
+    if (hasNonOwnerCommit) {
+      // ✅ si hay commits de otro usuario -> rama debe permanecer
+      return { deleted: false, reason: "has_non_owner_commits" };
+    }
+
+    // si solo hay commits del owner/bots, sí puedes borrarla según tu regla
+  }
+
+  // 3) borrar ref
+  try {
+    await client.deleteRef(owner, repo, `heads/${b}`);
+    return { deleted: true, reason: hasOwnChanges ? "deleted_owner_or_bot_only" : "deleted_no_changes" };
+  } catch (e: any) {
+    if (e?.status === 404) return { deleted: false, reason: "ref_already_deleted" };
+    return { deleted: false, reason: "delete_failed" };
+  }
 }
