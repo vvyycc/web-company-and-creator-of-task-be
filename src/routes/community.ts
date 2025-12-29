@@ -14,18 +14,15 @@ import {
 
 import { getOctokitForEmail } from "../services/github";
 import {
-  SPEC_PATH,
   buildChecklistFromSpec,
   buildTaskBranchName,
-  commitFileToBranch,
-  detectRepoStack,
-  fetchVerificationSpec,
   generateVerificationSpec,
+  fetchVerificationSpec,
+  ensureVerificationFilesInBranch,
   pollOrFetchLatestRun,
-  translateSpecToTests,
   triggerWorkflow,
-  ensureWorkflowExists,
 } from "../services/verificationSpec";
+import { normalizeProjectStack, ProjectStack } from "../models/stack";
 
 export type ColumnId = "todo" | "doing" | "review" | "done";
 
@@ -470,6 +467,7 @@ router.post(
       const newId = new mongoose.Types.ObjectId();
 
       const tasks: any[] = Array.isArray(estimation?.tasks) ? estimation.tasks : [];
+      estimation.stack = normalizeProjectStack(estimation.stack as any);
 
       // ✅ normalizamos tasks al publicar (ids válidos y persistidos)
       const used = new Set<string>();
@@ -581,6 +579,7 @@ router.post(
         projectDescription,
         estimation,
         technicalChecklist, // ✅ recomendado: root para acceso fácil en listados
+        stack: estimation.stack,
         isPublished: true,
       });
 
@@ -911,6 +910,7 @@ router.post(
       if (!doc || !doc.isPublished) return res.status(404).json({ error: "Proyecto no encontrado" });
 
       await normalizeAndPersistTaskIds(doc);
+      const projectStack: ProjectStack = normalizeProjectStack((doc.estimation as any)?.stack);
 
       // ✅ si falta repo del proyecto -> no se puede asignar (porque necesitamos crear branch)
       const projectRepoFullName =
@@ -1041,20 +1041,12 @@ router.post(
         title: task.title,
         description: task.description,
         acceptanceCriteria: task.acceptanceCriteria,
-      });
-      const specPath = `${SPEC_PATH}/task-${task.id}.json`;
+      }, projectStack);
 
       try {
-        await commitFileToBranch(
-          projectRepoFullName,
-          branchName,
-          specPath,
-          JSON.stringify(spec, null, 2),
-          `chore: add verification spec for task ${task.id}`,
-          doc.ownerEmail
-        );
+        await ensureVerificationFilesInBranch(projectRepoFullName, branchName, spec, doc.ownerEmail);
       } catch (e: any) {
-        console.error("[community:assign] spec commit failed", {
+        console.error("[community:assign] verification setup failed", {
           projectId: id,
           taskId,
           repo: projectRepoFullName,
@@ -1062,11 +1054,14 @@ router.post(
           message: e?.message,
           status: e?.status,
         });
-        return res.status(500).json({ error: "spec_commit_failed" });
+        return res.status(500).json({ error: "verification_setup_failed" });
       }
 
       // checklist basado en spec
-      task.checklist = buildChecklistFromSpec(spec, task.checklist);
+      task.checklist = buildChecklistFromSpec(spec, task.checklist).map((item) => ({
+        ...item,
+        status: "PENDING" as ChecklistStatus,
+      }));
 
       // ✅ asignación
       task.assigneeEmail = userEmail;
@@ -1108,6 +1103,7 @@ router.post(
       if (!doc || !doc.isPublished) return res.status(404).json({ error: "Proyecto no encontrado" });
 
       await normalizeAndPersistTaskIds(doc);
+      const projectStack: ProjectStack = normalizeProjectStack((doc.estimation as any)?.stack);
 
       try {
         const membership = await ensureRepoMember(id, userEmail);
@@ -1214,6 +1210,7 @@ router.post(
       if (!doc || !doc.isPublished) return res.status(404).json({ error: "Proyecto no encontrado" });
 
       await normalizeAndPersistTaskIds(doc);
+      const projectStack: ProjectStack = normalizeProjectStack((doc.estimation as any)?.stack);
 
       try {
         const membership = await ensureRepoMember(id, userEmail);
@@ -1273,6 +1270,38 @@ router.post(
         }
       }
 
+      const branchName = task.repo.branch || buildTaskBranchName({ id: String(task.id), title: task.title });
+      if (!task.repo.branch) {
+        task.repo.branch = branchName;
+      }
+      const spec = generateVerificationSpec(
+        {
+          id: String(task.id),
+          title: task.title,
+          description: task.description,
+          acceptanceCriteria: task.acceptanceCriteria,
+        },
+        projectStack
+      );
+
+      try {
+        await ensureVerificationFilesInBranch(task.repo.repoFullName!, branchName, spec, doc.ownerEmail);
+      } catch (error: any) {
+        console.error("[community:submit-review] ensure verification failed", {
+          projectId: id,
+          taskId,
+          repo: task.repo.repoFullName,
+          branch: branchName,
+          message: error?.message,
+        });
+        return res.status(500).json({ error: "verification_setup_failed" });
+      }
+
+      task.checklist = buildChecklistFromSpec(spec, task.checklist).map((item) => ({
+        ...item,
+        status: "PENDING" as ChecklistStatus,
+      }));
+
       task.repo.checks = task.repo.checks || { status: "IDLE" };
       task.repo.checks.status = "PENDING";
       task.repo.checks.lastRunConclusion = null;
@@ -1329,6 +1358,7 @@ router.post(
       if (!doc || !doc.isPublished) return res.status(404).json({ error: "Proyecto no encontrado" });
 
       await normalizeAndPersistTaskIds(doc);
+      const projectStack: ProjectStack = normalizeProjectStack((doc.estimation as any)?.stack);
 
       const estimation: any = doc.estimation || {};
       const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
@@ -1388,6 +1418,7 @@ router.post(
       if (!doc || !doc.isPublished) return res.status(404).json({ error: "Proyecto no encontrado" });
 
       await normalizeAndPersistTaskIds(doc);
+      const projectStack: ProjectStack = normalizeProjectStack((doc.estimation as any)?.stack);
 
       const estimation: any = doc.estimation || {};
       const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
@@ -1454,6 +1485,7 @@ router.post(
       }
 
       await normalizeAndPersistTaskIds(doc);
+      const projectStack: ProjectStack = normalizeProjectStack((doc.estimation as any)?.stack);
 
       const estimation: any = doc.estimation || {};
       const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
@@ -1531,34 +1563,29 @@ router.post(
 
       // asegurar spec en rama
       let spec = await fetchVerificationSpec(repoFullName, finalBranch, String(task.id), doc.ownerEmail);
-      const generatedSpec = generateVerificationSpec({
-        id: String(task.id),
-        title: task.title,
-        description: task.description,
-        acceptanceCriteria: task.acceptanceCriteria,
-      });
       if (!spec) {
-        spec = generatedSpec;
+        spec = generateVerificationSpec(
+          {
+            id: String(task.id),
+            title: task.title,
+            description: task.description,
+            acceptanceCriteria: task.acceptanceCriteria,
+          },
+          projectStack
+        );
       }
 
       try {
-        await commitFileToBranch(
-          repoFullName,
-          finalBranch,
-          `${SPEC_PATH}/task-${task.id}.json`,
-          JSON.stringify(spec, null, 2),
-          `chore: ensure verification spec for task ${task.id}`,
-          doc.ownerEmail
-        );
+        await ensureVerificationFilesInBranch(repoFullName, finalBranch, spec, doc.ownerEmail);
       } catch (error: any) {
-        console.error("[community:run-verify] spec commit failed", {
+        console.error("[community:run-verify] verification setup failed", {
           projectId: id,
           taskId,
           repo: repoFullName,
           branch: finalBranch,
           message: error?.message,
         });
-        return res.status(500).json({ error: "spec_commit_failed" });
+        return res.status(500).json({ error: "verification_setup_failed" });
       }
 
       // sincroniza checklist
@@ -1574,32 +1601,6 @@ router.post(
       task.verificationStatus = "SUBMITTED";
       task.verification = task.verification || { status: "SUBMITTED" };
       task.verification.status = "SUBMITTED";
-
-      const stack = await detectRepoStack(repoFullName, finalBranch, doc.ownerEmail);
-      const testFiles = translateSpecToTests(stack, spec);
-
-      try {
-        for (const file of testFiles) {
-          await commitFileToBranch(
-            repoFullName,
-            finalBranch,
-            file.path,
-            file.content,
-            `test: add verification for task ${task.id}`,
-            doc.ownerEmail
-          );
-        }
-        await ensureWorkflowExists(stack, repoFullName, finalBranch, doc.ownerEmail);
-      } catch (error: any) {
-        console.error("[community:run-verify] committing tests/workflow failed", {
-          projectId: id,
-          taskId,
-          repo: repoFullName,
-          branch: finalBranch,
-          message: error?.message,
-        });
-        return res.status(500).json({ error: "verification_setup_failed" });
-      }
 
       estimation.tasks = tasks;
       doc.estimation = estimation;

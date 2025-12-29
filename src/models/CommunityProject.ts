@@ -1,6 +1,7 @@
 // src/models/CommunityProject.ts
 import { Schema, model, Document } from 'mongoose';
 import { GeneratedTask } from './Project';
+import { ProjectStack, DEFAULT_PROJECT_STACK } from './stack';
 
 export interface ProjectEstimation {
   id?: string;
@@ -16,6 +17,7 @@ export interface ProjectEstimation {
   generatorFee?: number;
   grandTotalClientCost: number;
   published?: boolean;
+  stack?: ProjectStack;
 }
 
 export interface CommunityProjectDocument extends Document {
@@ -23,6 +25,7 @@ export interface CommunityProjectDocument extends Document {
   projectTitle: string;
   projectDescription: string;
   estimation: ProjectEstimation;
+  stack?: ProjectStack;
   projectRepo?: {
     name?: string;
     fullName: string;
@@ -45,6 +48,7 @@ const CommunityProjectSchema = new Schema<CommunityProjectDocument>(
       fullName: { type: String },
       htmlUrl: { type: String },
     },
+    stack: { type: Schema.Types.Mixed, default: DEFAULT_PROJECT_STACK },
     isPublished: { type: Boolean, default: true },
   },
   { timestamps: true }

@@ -176,6 +176,7 @@ router.post(
         // Si tu schema no tiene estos campos, bórralos:
         platformFeeAmount: estimation.platformFeeAmount,
         grandTotalClientCost: estimation.grandTotalClientCost,
+        stack: estimation.stack,
 
         published: false,
       });

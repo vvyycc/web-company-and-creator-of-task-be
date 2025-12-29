@@ -1,8 +1,10 @@
 import path from "path";
 import { connectMongo } from "../db/mongo";
 import { CommunityProject } from "../models/CommunityProject";
+import { ProjectStack, normalizeProjectStack, DEFAULT_PROJECT_STACK } from "../models/stack";
 import type { ChecklistItem, ChecklistStatus } from "../routes/community";
 import { getOctokitForEmail } from "./github";
+import { getStackAdapter, AdapterCommands } from "./stackAdapters";
 
 export type VerificationExpectationType =
   | "http"
@@ -21,6 +23,7 @@ export type VerificationExpectation = {
   type: VerificationExpectationType;
   target?: string;
   successCriteria?: string[];
+  artifacts?: Array<{ path: string; mustExist?: boolean; contains?: string[] }>;
 };
 
 export type VerificationSpec = {
@@ -28,20 +31,11 @@ export type VerificationSpec = {
   title: string;
   description?: string;
   acceptanceCriteria?: string;
+  stack: ProjectStack;
   version: string;
   generatedAt: string;
   expectations: VerificationExpectation[];
 };
-
-export type RepoStack =
-  | "node"
-  | "solidity_foundry"
-  | "solidity_hardhat"
-  | "java_maven"
-  | "java_gradle"
-  | "php"
-  | "frontend_playwright"
-  | "unknown";
 
 export type GeneratedTestFile = { path: string; content: string };
 
@@ -105,12 +99,15 @@ function extractExpectationLines(acceptance?: string, description?: string) {
     .slice(0, 6);
 }
 
-export const generateVerificationSpec = (task: {
-  id: string;
-  title?: string;
-  description?: string;
-  acceptanceCriteria?: string;
-}): VerificationSpec => {
+export const generateVerificationSpec = (
+  task: {
+    id: string;
+    title?: string;
+    description?: string;
+    acceptanceCriteria?: string;
+  },
+  projectStack?: ProjectStack | null
+): VerificationSpec => {
   const lines = extractExpectationLines(task.acceptanceCriteria, task.description);
   const expectations: VerificationExpectation[] = lines.map((text, index) => {
     const key = `${slugify(text || `item-${index}`, "item")}-${index}`;
@@ -136,11 +133,14 @@ export const generateVerificationSpec = (task: {
     });
   }
 
+  const stack = normalizeProjectStack(projectStack);
+
   return {
     taskId: task.id,
     title: task.title || "Task",
     description: task.description,
     acceptanceCriteria: task.acceptanceCriteria,
+    stack,
     version: "1.0.0",
     generatedAt: new Date().toISOString(),
     expectations,
@@ -239,12 +239,12 @@ export const detectRepoStack = async (
   repoFullName: string,
   branch: string,
   actorEmail?: string
-): Promise<RepoStack> => {
+): Promise<ProjectStack> => {
   const [owner, repo] = String(repoFullName).split("/");
-  if (!owner || !repo) return "unknown";
+  if (!owner || !repo) return DEFAULT_PROJECT_STACK;
 
   const email = actorEmail || (await resolveOwnerEmailByRepo(repoFullName));
-  if (!email) return "unknown";
+  if (!email) return DEFAULT_PROJECT_STACK;
 
   const { client } = await getOctokitForEmail(email);
 
@@ -257,58 +257,39 @@ export const detectRepoStack = async (
     const includes = (filename: string) =>
       paths.some((p) => p === filename.toLowerCase() || p.endsWith(`/${filename.toLowerCase()}`));
 
-    if (includes("package.json")) return "node";
-    if (includes("foundry.toml")) return "solidity_foundry";
-    if (paths.some((p) => p.includes("hardhat.config"))) return "solidity_hardhat";
-    if (includes("pom.xml")) return "java_maven";
-    if (includes("build.gradle") || includes("build.gradle.kts")) return "java_gradle";
-    if (includes("composer.json")) return "php";
-    if (includes("playwright.config.ts") || includes("playwright.config.js")) return "frontend_playwright";
+    if (includes("package.json")) return { ...DEFAULT_PROJECT_STACK, primary: "node" };
+    if (includes("foundry.toml")) return { primary: "solidity", testRunner: "foundry", packageManager: "npm" };
+    if (paths.some((p) => p.includes("hardhat.config"))) return { primary: "solidity", testRunner: "hardhat", packageManager: "npm" };
+    if (includes("pom.xml")) return { primary: "java", testRunner: "maven" };
+    if (includes("build.gradle") || includes("build.gradle.kts")) return { primary: "java", testRunner: "gradle" };
+    if (includes("composer.json")) return { primary: "php", testRunner: "phpunit" };
+    if (includes("playwright.config.ts") || includes("playwright.config.js")) return { primary: "react", testRunner: "playwright" };
 
-    return "unknown";
+    return DEFAULT_PROJECT_STACK;
   } catch (error) {
     console.warn("[verification] Stack detection failed:", error);
-    return "unknown";
+    return DEFAULT_PROJECT_STACK;
   }
 };
 
-const buildNodeTest = (spec: VerificationSpec) => {
-  const expectations = spec.expectations
-    .map(
-      (exp) => `test('${exp.key} - ${exp.title}', () => {
-  assert.ok(spec.expectations.find((e) => e.key === '${exp.key}'), 'Expectation missing in spec');
-  assert.ok(true, 'TODO: Implement verification for ${exp.type}');
-});`
-    )
-    .join("\n\n");
+const workflowForStack = (stack: ProjectStack, commands?: AdapterCommands) => {
+  const installCmd = (commands?.install || "").replace(/\n+/g, "\n").trim();
+  const testCmd = (commands?.test || "").replace(/\n+/g, "\n").trim();
 
-  return `import test from 'node:test';
-import assert from 'node:assert';
-import fs from 'node:fs';
-import path from 'node:path';
-
-const specPath = path.join(process.cwd(), '${SPEC_DIR}', 'task-${spec.taskId}.json');
-const raw = fs.readFileSync(specPath, 'utf8');
-const spec = JSON.parse(raw);
-
-test('spec metadata', () => {
-  assert.ok(spec.taskId, 'taskId missing');
-  assert.ok(Array.isArray(spec.expectations) && spec.expectations.length > 0, 'expectations missing');
-});
-
-${expectations}
-`;
-};
-
-export const translateSpecToTests = (stack: RepoStack, spec: VerificationSpec): GeneratedTestFile[] => {
-  const testContent = buildNodeTest(spec);
-  const testPath = path.posix.join("verification", `task-${spec.taskId}.spec.js`);
-  return [{ path: testPath, content: testContent }];
-};
-
-const workflowForStack = (stack: RepoStack) => `name: verify
+  return `name: community-verify
 
 on:
+  push:
+    branches:
+      - 'task/**'
+      - 'community/**'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - '.community/verification/**'
+      - 'verification/**'
+      - 'tests/**'
+      - '**/*.spec.*'
   workflow_dispatch:
     inputs:
       projectId:
@@ -324,52 +305,144 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    env:
+      VERIFY_PRIMARY: ${stack.primary}
+      VERIFY_TEST_RUNNER: ${stack.testRunner || ""}
+      VERIFY_PACKAGE_MANAGER: ${stack.packageManager || ""}
+      VERIFY_INSTALL_COMMAND: "${installCmd}"
+      VERIFY_TEST_COMMAND: "${testCmd}"
     steps:
       - name: Checkout task branch
         uses: actions/checkout@v4
         with:
-          ref: \${{ inputs.branch }}
+          ref: \${{ inputs.branch || github.ref_name }}
+
+      - name: Locate verification spec
+        id: spec
+        run: |
+          mkdir -p .community/verification
+          FILE=$(ls .community/verification/task-*.json 2>/dev/null | head -n 1 || true)
+          if [ -z "$FILE" ]; then
+            echo "No verification spec found" >&2
+            exit 1
+          fi
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          SPEC_FILE="$FILE" node -e "const fs=require('fs'); const f=process.env.SPEC_FILE; const d=JSON.parse(fs.readFileSync(f,'utf8')); const out=fs.createWriteStream(process.env.GITHUB_OUTPUT,{flags:'a'}); out.write('primary='+ (d.stack?.primary||'unknown')+'\\n'); out.write('runner='+ (d.stack?.testRunner||'')+'\\n'); out.write('pm='+ (d.stack?.packageManager||'')+'\\n');"
 
       - name: Setup Node
+        if: startsWith(steps.spec.outputs.primary, 'node') || steps.spec.outputs.primary == 'nextjs' || steps.spec.outputs.primary == 'react' || steps.spec.outputs.primary == 'vue' || steps.spec.outputs.primary == 'angular' || steps.spec.outputs.primary == 'solidity'
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
+      - name: Setup Python
+        if: steps.spec.outputs.primary == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Java
+        if: steps.spec.outputs.primary == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup PHP
+        if: steps.spec.outputs.primary == 'php'
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+
       - name: Install dependencies
         run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          elif [ -f package.json ]; then
-            npm install
-          else
-            echo "No package.json found, skipping install"
+          if [ -n "$VERIFY_INSTALL_COMMAND" ]; then
+            eval "$VERIFY_INSTALL_COMMAND"
+            exit $?
           fi
+          PM="\${STACK_PM:-$VERIFY_PACKAGE_MANAGER}"
+          if [ "$PM" = "pnpm" ]; then npm install -g pnpm && pnpm install; elif [ "$PM" = "yarn" ]; then yarn install --frozen-lockfile || yarn install; elif [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; elif [ -f requirements.txt ]; then pip install -r requirements.txt; elif [ -f pom.xml ]; then mvn -B -ntp dependency:resolve; elif [ -f composer.json ]; then composer install --no-interaction --no-progress; else echo "No dependency manifest found"; fi
+        env:
+          STACK_PM: \${{ steps.spec.outputs.pm }}
 
-      - name: Run generated verification
+      - name: Run verification tests
         run: |
-          if ls verification/*.spec.js 1> /dev/null 2>&1; then
-            node --test verification/*.spec.js
-          else
-            echo "No generated verification tests found"
+          if [ -n "$VERIFY_TEST_COMMAND" ]; then
+            eval "$VERIFY_TEST_COMMAND"
+            exit $?
           fi
+          PRIMARY="\${STACK_PRIMARY}"
+          if [ "$PRIMARY" = "python" ]; then pytest -q || pytest; elif [ "$PRIMARY" = "java" ]; then mvn -B -ntp test; elif [ "$PRIMARY" = "php" ]; then vendor/bin/phpunit || phpunit; elif [ "$PRIMARY" = "solidity" ]; then npx hardhat test || npm test -- --runInBand; else node --test verification/**/*.spec.js verification/**/*.spec.ts || npm test -- --runInBand || npm run test; fi
+        env:
+          STACK_PRIMARY: \${{ steps.spec.outputs.primary }}
+
+      - name: Upload verification artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: community-verification-results
+          path: |
+            verification/**
+            .community/verification/**
 `;
+};
 
 export const ensureWorkflowExists = async (
-  stack: RepoStack,
+  stack: ProjectStack,
   repoFullName: string,
   branch: string,
+  commands?: AdapterCommands,
   actorEmail?: string
 ) => {
-  const workflowPath = ".github/workflows/verify.yml";
-  const content = workflowForStack(stack);
+  const workflowPath = ".github/workflows/community-verify.yml";
+  const content = workflowForStack(stack, commands);
   return commitFileToBranch(
     repoFullName,
     branch,
     workflowPath,
     content,
-    "chore: ensure verification workflow",
+    "chore: ensure community verification workflow",
     actorEmail
   );
+};
+
+export const ensureVerificationFilesInBranch = async (
+  repoFullName: string,
+  branch: string,
+  spec: VerificationSpec,
+  actorEmail?: string
+) => {
+  const normalizedSpec = { ...spec, stack: normalizeProjectStack(spec.stack) };
+  const adapter = getStackAdapter(normalizedSpec.stack);
+  const adapterResult = adapter.generate(normalizedSpec);
+
+  const filePath = path.posix.join(SPEC_DIR, `task-${spec.taskId}.json`);
+  await commitFileToBranch(
+    repoFullName,
+    branch,
+    filePath,
+    JSON.stringify(normalizedSpec, null, 2),
+    `chore: add verification spec for task ${spec.taskId}`,
+    actorEmail
+  );
+
+  for (const file of adapterResult.files) {
+    await commitFileToBranch(
+      repoFullName,
+      branch,
+      file.path,
+      file.content,
+      `test: add verification for task ${spec.taskId}`,
+      actorEmail
+    );
+  }
+
+  await ensureWorkflowExists(normalizedSpec.stack, repoFullName, branch, adapterResult.commands, actorEmail);
+
+  return {
+    adapter: adapter.id,
+    filesGenerated: adapterResult.files.map((f) => f.path),
+  };
 };
 
 export const triggerWorkflow = async (
@@ -383,7 +456,7 @@ export const triggerWorkflow = async (
   if (!owner || !repo || !email) throw new Error("invalid_repo_context");
 
   const { client } = await getOctokitForEmail(email);
-  await client.dispatchWorkflow(owner, repo, "verify.yml", branch, {
+  await client.dispatchWorkflow(owner, repo, "community-verify.yml", branch, {
     projectId: payload.projectId,
     taskId: payload.taskId,
     branch,
@@ -401,7 +474,7 @@ export const pollOrFetchLatestRun = async (
 
   const { client } = await getOctokitForEmail(email);
   try {
-    const runs = await client.listWorkflowRuns(owner, repo, { branch, workflowId: "verify.yml", per_page: 5 });
+    const runs = await client.listWorkflowRuns(owner, repo, { branch, workflowId: "community-verify.yml", per_page: 5 });
     const run =
       runs?.workflow_runs?.find((r: any) => String(r.head_branch) === branch) ||
       runs?.workflow_runs?.[0];
