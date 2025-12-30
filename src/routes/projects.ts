@@ -5,9 +5,10 @@ import { connectMongo } from '../db/mongo';
 import { ProjectModel, ProjectDocument } from '../models/Project';
 import { Subscription } from '../models/Subscription';
 import { TaskDocument } from '../models/Task';
+import { TaskCategory } from '../models/taskTypes';
 import { emitTaskEvent } from '../services/taskEvents';
 import mongoose from 'mongoose';
-import { generateProjectEstimationFromDescription } from "../services/generateTasks";
+import { categoryToLayer, generateProjectEstimationFromDescription } from "../services/generateTasks";
 
 
 const router = express.Router();
@@ -155,11 +156,35 @@ router.post(
         });
       }
 
-      // ✅ AQUÍ estaba el mock (buildSampleTasks). Lo cambiamos por el generador real:
-      const estimation = generateProjectEstimationFromDescription({
+      // ✅ Generador inteligente (IA opcional + heurística con fallback seguro)
+      const estimation = await generateProjectEstimationFromDescription({
         ownerEmail,
         projectTitle: resolvedTitle,
         projectDescription: resolvedDescription,
+      });
+
+      const mappedTasks: Array<Omit<TaskDocument, "_id">> = estimation.tasks.map((task, index) => {
+        const category = (task.category as TaskCategory) || "SERVICE";
+        const layer = categoryToLayer(category) as TaskDocument["layer"];
+        const price = task.taskPrice ?? task.price ?? 0;
+
+        return {
+          title: task.title,
+          description: task.description,
+          priority: task.priority ?? index + 1,
+          price,
+          layer,
+          columnId: "todo",
+          status: "TODO",
+          assignedToEmail: null,
+          assignedAt: null,
+          acceptanceCriteria: "",
+          verificationType: "MANUAL",
+          verificationStatus: "NOT_SUBMITTED",
+          verificationNotes: "",
+          verifiedByEmail: null,
+          verifiedAt: null,
+        };
       });
 
       const project = await ProjectModel.create({
@@ -167,7 +192,7 @@ router.post(
         title: resolvedTitle,
         description: resolvedDescription,
 
-        tasks: estimation.tasks,
+        tasks: mappedTasks,
         totalTasksPrice: estimation.totalTasksPrice,
 
         generatorFee: 0, // lo cobras por suscripción
@@ -177,6 +202,7 @@ router.post(
         platformFeeAmount: estimation.platformFeeAmount,
         grandTotalClientCost: estimation.grandTotalClientCost,
         stack: estimation.stack,
+        estimation,
 
         published: false,
       });

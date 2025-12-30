@@ -2,6 +2,7 @@
 import { Schema, model, Document } from 'mongoose';
 import { GeneratedTask } from './Project';
 import { ProjectStack, DEFAULT_PROJECT_STACK } from './stack';
+import { RecommendedStack, StackSource } from './recommendedStack';
 
 export interface ProjectEstimation {
   id?: string;
@@ -16,6 +17,9 @@ export interface ProjectEstimation {
   generatorServiceFee?: number;
   generatorFee?: number;
   grandTotalClientCost: number;
+  recommendedStack?: RecommendedStack;
+  stackSource?: StackSource;
+  stackConfidence?: number;
   published?: boolean;
   stack?: ProjectStack;
 }
