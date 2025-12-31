@@ -12,6 +12,7 @@ import integrationsGithubRouter from "./routes/integrationsGithub";
 import githubWebhookRouter from "./routes/githubWebhook";
 import { connectMongo } from "./db/mongo";
 import { initSocket } from "./socket";
+import taskGeneratorRouter from "./routes/taskGenerator";
 
 dotenv.config();
 
@@ -46,6 +47,8 @@ app.use(
 );
 
 app.use(express.json());
+
+app.use(taskGeneratorRouter);
 
 const EMAIL_REGEX = /^[\w.+-]+@[\w-]+\.[\w.-]+$/i;
 

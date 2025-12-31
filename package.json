@@ -18,6 +18,7 @@
     "googleapis": "^166.0.0",
     "mongoose": "^8.20.1",
     "nodemailer": "^6.9.16",
+    "openai": "^4.77.4",
     "socket.io": "^4.8.1",
     "stripe": "^20.0.0"
   },
