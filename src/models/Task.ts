@@ -11,7 +11,7 @@ export interface TaskDocument {
   status: 'TODO' | 'IN_PROGRESS' | 'IN_REVIEW' | 'DONE' | 'REJECTED';
   assignedToEmail?: string | null;
   assignedAt?: Date | null;
-  acceptanceCriteria: string;
+  acceptanceCriteria: string | string[];
   verificationType: 'MANUAL' | 'BACKEND' | 'FRONTEND' | 'WEB3' | 'SOLIDITY';
   verificationStatus: 'NOT_SUBMITTED' | 'SUBMITTED' | 'APPROVED' | 'REJECTED';
   verificationNotes: string;
@@ -40,7 +40,7 @@ export const TaskSchema = new Schema<TaskDocument>(
     },
     assignedToEmail: { type: String, default: null },
     assignedAt: { type: Date, default: null },
-    acceptanceCriteria: { type: String, default: '' },
+    acceptanceCriteria: { type: Schema.Types.Mixed, default: [] },
     verificationType: {
       type: String,
       enum: ['MANUAL', 'BACKEND', 'FRONTEND', 'WEB3', 'SOLIDITY'],

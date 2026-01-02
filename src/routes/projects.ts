@@ -7,7 +7,7 @@ import { Subscription } from '../models/Subscription';
 import { TaskDocument } from '../models/Task';
 import { emitTaskEvent } from '../services/taskEvents';
 import mongoose from 'mongoose';
-import { generateProjectEstimationFromDescription } from "../services/generateTasks";
+import { generateTasksController } from "../controllers/generateTasks.controller";
 
 
 const router = express.Router();
@@ -19,14 +19,6 @@ type TaskLayer = TaskDocument['layer'];
  * Body esperado en /projects/generate-tasks
  * (compatibilidad con versiones previas: projectTitle/title, projectDescription/description)
  */
-interface GenerateTasksRequestBody {
-  ownerEmail: string;
-  projectTitle?: string;
-  projectDescription?: string;
-  title?: string;
-  description?: string;
-}
-
 // --- columnas del "board" tipo Trello ---
 export const DEFAULT_COLUMNS: Array<{ id: ColumnId; title: string; order: number }> = [
   { id: 'todo', title: 'Por hacer', order: 1 },
@@ -132,61 +124,7 @@ const formatProject = (project: ProjectDocument) => {
  */
 router.post(
   "/generate-tasks",
-  async (req: Request<unknown, unknown, GenerateTasksRequestBody>, res: Response) => {
-    try {
-      const { ownerEmail, projectTitle, projectDescription, title, description } = req.body || {};
-
-      const resolvedTitle = projectTitle ?? title;
-      const resolvedDescription = projectDescription ?? description;
-
-      if (!ownerEmail || !resolvedTitle || !resolvedDescription) {
-        return res.status(400).json({
-          error: "ownerEmail, projectTitle y projectDescription (o title/description) son obligatorios",
-        });
-      }
-
-      await connectMongo();
-      const subscription = await Subscription.findOne({ email: ownerEmail });
-
-      if (!subscription || subscription.status !== "active") {
-        return res.status(402).json({
-          error: "subscription_required",
-          message: "Necesitas una suscripción activa de 30 €/mes para generar el troceado de tareas.",
-        });
-      }
-
-      // ✅ AQUÍ estaba el mock (buildSampleTasks). Lo cambiamos por el generador real:
-      const estimation = generateProjectEstimationFromDescription({
-        ownerEmail,
-        projectTitle: resolvedTitle,
-        projectDescription: resolvedDescription,
-      });
-
-      const project = await ProjectModel.create({
-        ownerEmail,
-        title: resolvedTitle,
-        description: resolvedDescription,
-
-        tasks: estimation.tasks,
-        totalTasksPrice: estimation.totalTasksPrice,
-
-        generatorFee: 0, // lo cobras por suscripción
-        platformFeePercent: estimation.platformFeePercent,
-
-        // Si tu schema no tiene estos campos, bórralos:
-        platformFeeAmount: estimation.platformFeeAmount,
-        grandTotalClientCost: estimation.grandTotalClientCost,
-        stack: estimation.stack,
-
-        published: false,
-      });
-
-      return res.status(200).json({ project: formatProject(project) });
-    } catch (error) {
-      console.error("Error generando tareas:", error);
-      return res.status(500).json({ error: "Error interno al generar tareas" });
-    }
-  }
+  generateTasksController
 );
 
 
