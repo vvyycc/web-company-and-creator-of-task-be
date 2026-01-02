@@ -1,6 +1,6 @@
 // src/services/taskGenerator.ts
 import { randomUUID } from "crypto";
-import { GeneratedTask, ProjectEstimation } from "../models/Project";
+import { GeneratedTask, ProjectEstimation, RecommendedStack, StackInference, StackMissing } from "../models/Project";
 import { TaskCategory, TaskComplexity } from "../models/taskTypes";
 import { HOURLY_RATE, PLATFORM_FEE_PERCENT } from "../config/pricing";
 import { DEFAULT_PROJECT_STACK } from "../models/stack";
@@ -174,6 +174,26 @@ function estimateHours(c: TaskComplexity, extra = 0) {
   return Math.round((complexityToPoints(c) + extra) * 2.5 * 2) / 2;
 }
 
+function detectWeb3Signals(projectDescription: string): { signals: string[]; hasNFT: boolean } {
+  const lower = normalize(projectDescription);
+  const signals = [
+    { key: "nft", patterns: ["nft", "erc721", "erc-721", "erc1155", "erc-1155"] },
+    { key: "marketplace", patterns: ["marketplace", "market place", "secondary sales", "royalties"] },
+    { key: "staking", patterns: ["staking", "stake", "yield"] },
+    { key: "airdrop", patterns: ["airdrop", "air drop", "claim"] },
+    { key: "wallet", patterns: ["metamask", "wallet", "rainbowkit", "wagmi"] },
+  ];
+
+  const matched: string[] = [];
+  signals.forEach(({ key, patterns }) => {
+    if (patterns.some((p) => lower.includes(p))) matched.push(key);
+  });
+
+  const hasNFT = matched.includes("nft") || matched.includes("marketplace");
+
+  return { signals: matched, hasNFT };
+}
+
 /* ======================================================
    Task factory
 ====================================================== */
@@ -203,6 +223,11 @@ function makeTask(params: {
     layer: categoryToLayer(params.category),
     price: taskPrice,
     developerNetPrice: taskPrice,
+    acceptanceCriteria: [
+      `Funciona la entrega de ${params.title}`,
+      `Incluye tests o comprobaciones básicas`,
+      `Cumple los edge cases definidos en "${params.description.slice(0, 80)}"`,
+    ],
     epic: params.epic,
   };
 }
@@ -387,6 +412,8 @@ export function generateProjectEstimationFromDescription(
 ): ProjectEstimation {
   const { projectTitle, projectDescription, ownerEmail } = input;
 
+  const { signals, hasNFT } = detectWeb3Signals(projectDescription);
+
   const tasks = buildSmartTasks(projectTitle, projectDescription);
 
   const totalHours = tasks.reduce((s, t) => s + t.estimatedHours, 0);
@@ -394,6 +421,57 @@ export function generateProjectEstimationFromDescription(
 
   const platformFeeAmount =
     (totalTasksPrice * PLATFORM_FEE_PERCENT) / 100;
+
+  const inferredStack: RecommendedStack = hasNFT
+    ? {
+        language: "Solidity",
+        framework: "Hardhat + OpenZeppelin",
+        blockchain: "EVM",
+        tooling: ["Ethers", "MetaMask/Wagmi"],
+        testing: "Hardhat + Chai",
+      }
+    : {
+        language: "TypeScript",
+        framework: "Node.js + Express",
+        database: "MongoDB",
+        testing: "Jest",
+        tooling: ["Prisma o Mongoose"],
+      };
+
+  const recommendedStack: RecommendedStack = hasNFT
+    ? {
+        ...inferredStack,
+        framework: "Hardhat + OpenZeppelin + Next.js",
+        database: "PostgreSQL o MongoDB",
+        tooling: ["Ethers", "MetaMask/Wagmi", "TheGraph opcional"],
+        infra: "Vercel + RPC provider (Alchemy/Infura)",
+      }
+    : {
+        ...inferredStack,
+        framework: "NestJS o Express + Next.js",
+        infra: "Vercel / Railway",
+      };
+
+  const stackMissing: StackMissing | undefined = hasNFT
+    ? {
+        blockchainSecurity: ["Revisión de roles y pausas"],
+        walletUX: ["Conectar wallets Web3"],
+      }
+    : undefined;
+
+  const stackInference: StackInference = {
+    inferred: inferredStack,
+    suggested: recommendedStack,
+    missing: stackMissing,
+    reasons: hasNFT
+      ? [
+          "Se menciona NFT/marketplace o señales Web3",
+          "Se requiere smart contracts y wallet para el MVP",
+        ]
+      : ["Proyecto backend/web estándar con APIs y frontend"],
+    signals: signals.length ? signals : undefined,
+    confidence: hasNFT ? 0.82 : 0.7,
+  };
 
   return {
     projectTitle,
@@ -406,5 +484,14 @@ export function generateProjectEstimationFromDescription(
     platformFeeAmount,
     grandTotalClientCost: totalTasksPrice + platformFeeAmount,
     stack: DEFAULT_PROJECT_STACK,
+    stackInferred: inferredStack,
+    stackRecommended: recommendedStack,
+    recommendedStack,
+    stackMissing,
+    stackInference,
+    stackInferredReasons: stackInference.reasons,
+    stackSignals: stackInference.signals,
+    stackSource: "HEURISTIC",
+    stackConfidence: stackInference.confidence,
   };
 }

@@ -3,6 +3,30 @@ import { TaskDocument, TaskSchema } from './Task';
 import { TaskCategory, TaskComplexity, ColumnId } from './taskTypes';
 import { DEFAULT_PROJECT_STACK, ProjectStack } from './stack';
 
+export interface StackMissing {
+  [area: string]: string[];
+}
+
+export interface RecommendedStack {
+  language?: string;
+  framework?: string;
+  database?: string;
+  infra?: string;
+  testing?: string;
+  blockchain?: string;
+  tooling?: string[];
+  notes?: string;
+}
+
+export interface StackInference {
+  inferred: RecommendedStack;
+  suggested: RecommendedStack;
+  missing?: StackMissing;
+  reasons: string[];
+  signals?: string[];
+  confidence: number;
+}
+
 
 
 export interface GeneratedTask {
@@ -15,6 +39,7 @@ export interface GeneratedTask {
   estimatedHours: number;
   hourlyRate: number;
   taskPrice: number;
+  acceptanceCriteria?: string | string[];
 
   // para el board tipo Trello
   columnId: ColumnId;
@@ -42,6 +67,20 @@ export interface ProjectEstimation {
   projectDurationHours?: number;
   criticalPathTaskIds?: string[];
   stack?: ProjectStack;
+  stackInferred?: RecommendedStack;
+  stackInferredReasons?: string[];
+  stackSignals?: string[];
+  stackRecommended?: RecommendedStack;
+  recommendedStack?: RecommendedStack;
+  stackMissing?: StackMissing;
+  stackInference?: StackInference;
+  stackSource?: "OPENAI" | "HEURISTIC";
+  stackConfidence?: number;
+  openaiMeta?: {
+    model: string;
+    responseId: string;
+    source: string;
+  };
 }
 export interface ProjectDocument extends Document {
   ownerEmail: string;
