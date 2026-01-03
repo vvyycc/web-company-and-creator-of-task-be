@@ -31,6 +31,16 @@ export interface CommunityProjectDocument extends Document {
     fullName: string;
     htmlUrl: string;
   };
+  projectRepos?: {
+    frontend?: { fullName: string; url?: string; defaultBranch?: string; name?: string };
+    backend?: { fullName: string; url?: string; defaultBranch?: string; name?: string };
+    hardhat?: { fullName: string; url?: string; defaultBranch?: string; name?: string };
+  };
+  repoMembers?: {
+    frontend?: Record<string, { state: "NONE" | "INVITED" | "ACTIVE"; repoUrl?: string; repoFullName?: string }>;
+    backend?: Record<string, { state: "NONE" | "INVITED" | "ACTIVE"; repoUrl?: string; repoFullName?: string }>;
+    hardhat?: Record<string, { state: "NONE" | "INVITED" | "ACTIVE"; repoUrl?: string; repoFullName?: string }>;
+  };
   isPublished: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -48,6 +58,8 @@ const CommunityProjectSchema = new Schema<CommunityProjectDocument>(
       fullName: { type: String },
       htmlUrl: { type: String },
     },
+    projectRepos: { type: Schema.Types.Mixed, default: {} },
+    repoMembers: { type: Schema.Types.Mixed, default: {} },
     stack: { type: Schema.Types.Mixed, default: DEFAULT_PROJECT_STACK },
     isPublished: { type: Boolean, default: true },
   },

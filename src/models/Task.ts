@@ -17,6 +17,9 @@ export interface TaskDocument {
   verificationNotes: string;
   verifiedByEmail?: string | null;
   verifiedAt?: Date | null;
+  repoType?: 'frontend' | 'backend' | 'hardhat';
+  repoKey?: 'frontend' | 'backend' | 'hardhat';
+  repoName?: string;
 }
 
 export type TaskStatus = TaskDocument['status'];
@@ -54,6 +57,9 @@ export const TaskSchema = new Schema<TaskDocument>(
     verificationNotes: { type: String, default: '' },
     verifiedByEmail: { type: String, default: null },
     verifiedAt: { type: Date, default: null },
+    repoType: { type: String, enum: ['frontend', 'backend', 'hardhat'], default: 'backend' },
+    repoKey: { type: String, enum: ['frontend', 'backend', 'hardhat'], default: 'backend' },
+    repoName: { type: String },
   },
   { _id: true }
 );

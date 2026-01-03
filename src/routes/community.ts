@@ -21,8 +21,10 @@ import {
   ensureVerificationFilesInBranch,
   pollOrFetchLatestRun,
   triggerWorkflow,
+  detectRepoStack,
 } from "../services/verificationSpec";
 import { normalizeProjectStack, ProjectStack } from "../models/stack";
+import { createRepoIfMissing, scaffoldBackend, scaffoldFrontend, scaffoldHardhat } from "../services/githubScaffold";
 
 export type ColumnId = "todo" | "doing" | "review" | "done";
 
@@ -46,6 +48,8 @@ export type ChecklistItem = {
   status: ChecklistStatus;
   details?: string;
 };
+
+export type RepoType = "frontend" | "backend" | "hardhat";
 
 export type TaskRepo = {
   provider?: "github";
@@ -87,6 +91,9 @@ export interface BoardTask {
   verificationStatus?: VerificationStatus;
   verification?: TaskVerification;
   repo?: TaskRepo | null;
+  repoType?: RepoType;
+  repoKey?: RepoType;
+  repoName?: string;
   acceptanceCriteria?: string;
   verificationNotes?: string;
   checklist?: ChecklistItem[];
@@ -133,6 +140,22 @@ const mapRepoErrorToResponse = (error: any, res: Response<any>) => {
 
   return false;
 };
+
+function resolveProjectRepo(doc: any, repoType?: RepoType) {
+  if (repoType && doc?.projectRepos?.[repoType]?.fullName) {
+    const r = doc.projectRepos[repoType];
+    return { fullName: r.fullName, url: r.htmlUrl || r.url, defaultBranch: r.defaultBranch };
+  }
+  const allTypes: RepoType[] = ["backend", "frontend", "hardhat"];
+  for (const key of allTypes) {
+    const r = doc?.projectRepos?.[key];
+    if (r?.fullName) return { fullName: r.fullName, url: r.htmlUrl || r.url, defaultBranch: r.defaultBranch };
+  }
+  if (doc?.projectRepo?.fullName) {
+    return { fullName: doc.projectRepo.fullName, url: doc.projectRepo.htmlUrl, defaultBranch: undefined };
+  }
+  return null;
+}
 
 function slugifyBranchName(input: string) {
   const s = String(input || "")
@@ -323,6 +346,25 @@ export function ensureTaskDefaults(task: any): boolean {
     task.repo = null;
   }
 
+  if (!task.repoType) {
+    const layer = String(task.layer ?? task.category ?? "").toUpperCase();
+    if (layer === "VIEW") task.repoType = "frontend";
+    else if (layer === "ARCHITECTURE") task.repoType = "backend";
+    else if (layer === "MODEL") task.repoType = "backend";
+    else if (layer === "SERVICE") task.repoType = "backend";
+    else task.repoType = "backend";
+    task.repoKey = task.repoType;
+    changed = true;
+  } else if (!task.repoKey) {
+    task.repoKey = task.repoType;
+    changed = true;
+  }
+
+  if (!task.repoName && task.repoType) {
+    task.repoName = `community-${slugifyBranchName(task.repoType)}-repo`;
+    changed = true;
+  }
+
   if (task.repo) {
     if (!task.repo.checks) {
       task.repo.checks = { status: "IDLE" };
@@ -401,6 +443,9 @@ export const mapTaskToBoard = (task: any): BoardTask => {
     verificationStatus: task.verificationStatus as VerificationStatus | undefined,
     verification: task.verification,
     repo: task.repo ?? null,
+    repoType: task.repoType ?? task.repoKey ?? "backend",
+    repoKey: task.repoKey ?? task.repoType ?? "backend",
+    repoName: task.repoName,
     acceptanceCriteria: task.acceptanceCriteria ?? task.acceptance ?? undefined,
     verificationNotes: task.verificationNotes ?? "",
     checklist: Array.isArray(task.checklist) ? task.checklist : buildChecklist(task),
@@ -486,6 +531,9 @@ router.post(
           columnId,
           assigneeEmail: t.assigneeEmail ?? null,
           assigneeAvatar: t.assigneeAvatar ?? null,
+          repoType: (t.repoType || t.repoKey || (t.layer === "VIEW" ? "frontend" : "backend")) as RepoType,
+          repoKey: (t.repoKey || t.repoType || (t.layer === "VIEW" ? "frontend" : "backend")) as RepoType,
+          repoName: t.repoName,
 
           status:
             t.status ??
@@ -583,30 +631,61 @@ router.post(
         isPublished: true,
       });
 
-      // ✅ Crear repo en GitHub al publicar (y guardar en doc.projectRepo)
+      // ✅ Crear repos en GitHub al publicar (multi-repo)
       try {
-        const repoInfo = await createProjectRepo(
-          ownerEmail,
-          newId.toString(),
-          projectTitle,
-          projectDescription
-        );
+        const repoPlan: Array<{ repoType: RepoType }> =
+          Array.isArray((estimation as any)?.repoPlan?.repos) ? (estimation as any).repoPlan.repos : [];
+        const desiredTypes: RepoType[] = repoPlan.length
+          ? (repoPlan.map((r) => r.repoType).filter(Boolean) as RepoType[])
+          : (["backend", "frontend"] as RepoType[]);
 
-        doc.projectRepo = repoInfo;
+        const projectRepos: Record<RepoType, any> = doc.projectRepos || {};
+        const slugBase = slugifyBranchName(projectTitle || "community-project");
+
+        for (const repoType of desiredTypes) {
+          const suffix = repoType;
+          const repoName = `community-${slugBase}-${suffix}`;
+          const created = await createRepoIfMissing(ownerEmail, repoName);
+          projectRepos[repoType] = {
+            fullName: created.fullName,
+            url: created.url,
+            defaultBranch: created.defaultBranch || "main",
+            name: created.name,
+          };
+
+          const branch = created.defaultBranch || "main";
+          if (repoType === "frontend") await scaffoldFrontend(created.fullName, ownerEmail, branch);
+          else if (repoType === "backend") await scaffoldBackend(created.fullName, ownerEmail, branch);
+          else if (repoType === "hardhat") await scaffoldHardhat(created.fullName, ownerEmail, branch);
+        }
+
+        doc.projectRepos = projectRepos;
+        const compatRepo = projectRepos.backend || projectRepos.frontend || Object.values(projectRepos)[0];
+        if (compatRepo) {
+          doc.projectRepo = {
+            name: compatRepo.name,
+            fullName: compatRepo.fullName,
+            htmlUrl: compatRepo.url,
+          };
+        }
         await doc.save();
 
         const io = getIO();
-        io.to(`community:${newId.toString()}`).emit("community:repoCreated", {
-          projectId: newId.toString(),
-          repoFullName: repoInfo.fullName,
-          repoUrl: repoInfo.htmlUrl,
-        });
+        for (const repoType of Object.keys(doc.projectRepos || {}) as RepoType[]) {
+          const repoInfo = (doc.projectRepos as any)[repoType];
+          io.to(`community:${newId.toString()}`).emit("community:repoCreated", {
+            projectId: newId.toString(),
+            repoFullName: repoInfo.fullName,
+            repoUrl: repoInfo.url,
+            repoType,
+          });
+        }
       } catch (repoError: any) {
         await doc.deleteOne();
         if (mapRepoErrorToResponse(repoError, res)) return;
 
-        console.error("[community] Error creando repo de proyecto:", repoError);
-        return res.status(500).json({ error: "Error interno creando repo de comunidad" });
+        console.error("[community] Error creando repos de proyecto:", repoError);
+        return res.status(500).json({ error: "Error interno creando repos de comunidad" });
       }
 
       const id = doc._id.toString();
@@ -665,6 +744,7 @@ router.get("/projects/:id/board", async (req: Request<{ id: string }>, res: Resp
       doc.projectRepo && doc.projectRepo.fullName && doc.projectRepo.htmlUrl
         ? { fullName: doc.projectRepo.fullName, htmlUrl: doc.projectRepo.htmlUrl }
         : null;
+    const projectRepos = doc.projectRepos || null;
 
     return res.status(200).json({
       project: {
@@ -674,8 +754,10 @@ router.get("/projects/:id/board", async (req: Request<{ id: string }>, res: Resp
         ownerEmail: doc.ownerEmail,
         published: doc.isPublished,
         projectRepo,
+        projectRepos,
       },
       projectRepo, // compat opcional
+      projectRepos,
       columns: BOARD_COLUMNS,
       tasks: rawTasks.map((t) => mapTaskToBoard(t)),
     });
@@ -703,27 +785,27 @@ router.get("/projects/:id/repo/status", async (req: Request<{ id: string }>, res
       return res.status(404).json({ error: "Proyecto de comunidad no encontrado" });
     }
 
-    if (!doc.projectRepo || !doc.projectRepo.fullName || !doc.projectRepo.htmlUrl) {
+    const repoInfo = resolveProjectRepo(doc, undefined);
+    if (!repoInfo?.fullName || !repoInfo.url) {
       return res.status(400).json({ error: "project_repo_missing" });
     }
 
-
-    const status = await ensureRepoMember(id, userEmail);
+    const status = await ensureRepoMember(id, userEmail, repoInfo.fullName);
 
     if (String(doc.ownerEmail).toLowerCase() === userEmail.toLowerCase()) {
       return res.status(200).json({
         joined: !!status?.joined,
         state: status?.state,        // ✅ NUEVO
-        repoUrl: status?.repoUrl,
-        repoFullName: status?.repoFullName,
+        repoUrl: repoInfo.url,
+        repoFullName: repoInfo.fullName,
       });
     }
 
     return res.status(200).json({
       joined: !!status?.joined,
       state: status?.state,        // ✅ NUEVO
-      repoUrl: status?.repoUrl,
-      repoFullName: status?.repoFullName,
+      repoUrl: repoInfo.url,
+      repoFullName: repoInfo.fullName,
     });
   } catch (error: any) {
     if (mapRepoErrorToResponse(error, res)) return;
@@ -732,6 +814,67 @@ router.get("/projects/:id/repo/status", async (req: Request<{ id: string }>, res
     return res.status(500).json({ error: "Error interno obteniendo estado del repo" });
   }
 });
+
+// ----------------- REPO STATUS (per repoType) -----------------
+router.get(
+  "/projects/:id/repos/:repoType/status",
+  async (
+    req: Request<{ id: string; repoType: RepoType }, unknown, unknown, { userEmail?: string }>,
+    res: Response
+  ) => {
+    try {
+      await connectMongo();
+      const { id, repoType } = req.params;
+      const userEmail = String(req.query.userEmail || "").trim();
+      if (!userEmail) return res.status(400).json({ error: "userEmail es obligatorio" });
+
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        return res.status(400).json({ error: "Identificador de proyecto no válido" });
+      }
+
+      const doc: any = await CommunityProject.findById(id);
+      if (!doc || !doc.isPublished) {
+        return res.status(404).json({ error: "Proyecto de comunidad no encontrado" });
+      }
+
+      const repoInfo = resolveProjectRepo(doc, repoType);
+      if (!repoInfo?.fullName) {
+        return res.status(400).json({ error: "project_repo_missing" });
+      }
+
+      const status = await ensureRepoMember(id, userEmail, repoInfo.fullName, repoType);
+
+      if (String(doc.ownerEmail).toLowerCase() === userEmail.toLowerCase()) {
+        return res.status(200).json({
+          joined: true,
+          state: "ACTIVE",
+          repoUrl: repoInfo.url,
+          repoFullName: repoInfo.fullName,
+        });
+      }
+
+      doc.repoMembers = doc.repoMembers || {};
+      doc.repoMembers[repoType] = doc.repoMembers[repoType] || {};
+      doc.repoMembers[repoType][userEmail] = {
+        state: status?.state || "NONE",
+        repoUrl: repoInfo.url,
+        repoFullName: repoInfo.fullName,
+      };
+      await doc.save();
+
+      return res.status(200).json({
+        joined: !!status?.joined,
+        state: status?.state,
+        repoUrl: repoInfo.url,
+        repoFullName: repoInfo.fullName,
+      });
+    } catch (error: any) {
+      if (mapRepoErrorToResponse(error, res)) return;
+      console.error("[community] Error obteniendo estado de repo por tipo:", error);
+      return res.status(500).json({ error: "Error interno obteniendo estado del repo" });
+    }
+  }
+);
 
 // ----------------- JOIN REPO -----------------
 router.post(
@@ -753,36 +896,108 @@ router.post(
         return res.status(404).json({ error: "Proyecto de comunidad no encontrado" });
       }
 
-      if (!doc.projectRepo || !doc.projectRepo.fullName || !doc.projectRepo.htmlUrl) {
+      const repoInfo = resolveProjectRepo(doc, undefined);
+      if (!repoInfo?.fullName || !repoInfo.url) {
         return res.status(400).json({ error: "project_repo_missing" });
       }
 
       if (String(doc.ownerEmail).toLowerCase() === userEmail.toLowerCase()) {
         return res.status(200).json({
           joined: true,
-          repoUrl: doc.projectRepo.htmlUrl,
-          repoFullName: doc.projectRepo.fullName,
+          repoUrl: repoInfo.url,
+          repoFullName: repoInfo.fullName,
         });
       }
 
-      const result = await inviteUserToRepo(id, userEmail);
+      const result = await inviteUserToRepo(id, userEmail, repoInfo.fullName);
 
       const io = getIO();
       io.to(`community:${id}`).emit("community:userInvitedToRepo", {
         projectId: id,
         userEmail,
-        repoUrl: result.repoUrl,
+        repoUrl: repoInfo.url,
       });
 
       return res.status(200).json({
         joined: !!result.joined,
-        repoUrl: result.repoUrl ?? doc.projectRepo.htmlUrl,
-        repoFullName: result.repoFullName ?? doc.projectRepo.fullName,
+        repoUrl: repoInfo.url,
+        repoFullName: repoInfo.fullName,
       });
     } catch (error: any) {
       if (mapRepoErrorToResponse(error, res)) return;
 
       console.error("[community] Error invitando usuario al repo:", error);
+      return res.status(500).json({ error: "Error interno invitando al repo" });
+    }
+  }
+);
+
+// ----------------- JOIN REPO (per repoType) -----------------
+router.post(
+  "/projects/:id/repos/:repoType/join",
+  async (
+    req: Request<{ id: string; repoType: RepoType }, unknown, { userEmail?: string }>,
+    res: Response
+  ) => {
+    try {
+      await connectMongo();
+
+      const { id, repoType } = req.params;
+      const userEmail = String(req.body?.userEmail || "").trim();
+      if (!userEmail) return res.status(400).json({ error: "userEmail es obligatorio" });
+
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        return res.status(400).json({ error: "Identificador de proyecto no válido" });
+      }
+
+      const doc: any = await CommunityProject.findById(id);
+      if (!doc || !doc.isPublished) {
+        return res.status(404).json({ error: "Proyecto de comunidad no encontrado" });
+      }
+
+      const repoInfo = resolveProjectRepo(doc, repoType);
+      if (!repoInfo?.fullName) {
+        return res.status(400).json({ error: "project_repo_missing" });
+      }
+
+      if (String(doc.ownerEmail).toLowerCase() === userEmail.toLowerCase()) {
+        return res.status(200).json({
+          joined: true,
+          repoUrl: repoInfo.url,
+          repoFullName: repoInfo.fullName,
+          state: "ACTIVE",
+        });
+      }
+
+      const result = await inviteUserToRepo(id, userEmail, repoInfo.fullName, repoType);
+
+      doc.repoMembers = doc.repoMembers || {};
+      doc.repoMembers[repoType] = doc.repoMembers[repoType] || {};
+      doc.repoMembers[repoType][userEmail] = {
+        state: result?.state || "INVITED",
+        repoUrl: repoInfo.url,
+        repoFullName: repoInfo.fullName,
+      };
+      await doc.save();
+
+      const io = getIO();
+      io.to(`community:${id}`).emit("community:userInvitedToRepo", {
+        projectId: id,
+        userEmail,
+        repoUrl: repoInfo.url,
+        repoFullName: repoInfo.fullName,
+      });
+
+      return res.status(200).json({
+        joined: !!result.joined,
+        repoUrl: repoInfo.url,
+        repoFullName: repoInfo.fullName,
+        state: result?.state,
+      });
+    } catch (error: any) {
+      if (mapRepoErrorToResponse(error, res)) return;
+
+      console.error("[community] Error invitando usuario al repo por tipo:", error);
       return res.status(500).json({ error: "Error interno invitando al repo" });
     }
   }
@@ -912,34 +1127,6 @@ router.post(
       await normalizeAndPersistTaskIds(doc);
       const projectStack: ProjectStack = normalizeProjectStack((doc.estimation as any)?.stack);
 
-      // ✅ si falta repo del proyecto -> no se puede asignar (porque necesitamos crear branch)
-      const projectRepoFullName =
-        typeof doc.projectRepo === "string"
-          ? doc.projectRepo
-          : doc.projectRepo?.fullName || doc.projectRepo?.repoFullName || null;
-
-      if (!projectRepoFullName || !String(projectRepoFullName).includes("/")) {
-        return res.status(400).json({ error: "project_repo_missing" });
-      }
-
-      // ✅ debe ser miembro/invitado antes de asignar
-      try {
-        const membership = await ensureRepoMember(id, userEmail);
-
-        // ✅ SOLO si aceptó invitación (ACTIVE) puede asignar/mover
-        if (membership?.state !== "ACTIVE") {
-          return res.status(403).json({
-            error: "repo_access_required",
-            state: membership?.state || "NONE",
-            repoUrl: membership?.repoUrl,
-          });
-        }
-
-      } catch (error: any) {
-        if (mapRepoErrorToResponse(error, res)) return;
-        throw error;
-      }
-
       if (String(doc.ownerEmail).toLowerCase() === String(userEmail).toLowerCase()) {
         return res.status(403).json({ error: "El creador del proyecto no puede tomar tareas" });
       }
@@ -957,6 +1144,30 @@ router.post(
 
       const task = tasks.find((t) => String(t.id) === String(taskId));
       if (!task) return res.status(404).json({ error: "Tarea no encontrada" });
+      ensureTaskDefaults(task);
+
+      const repoInfo = resolveProjectRepo(doc, (task.repoType || task.repoKey) as RepoType | undefined);
+      const projectRepoFullName = repoInfo?.fullName;
+      if (!projectRepoFullName || !String(projectRepoFullName).includes("/")) {
+        return res.status(400).json({ error: "project_repo_missing" });
+      }
+
+      // ✅ debe ser miembro/invitado antes de asignar
+      try {
+        const membership = await ensureRepoMember(id, userEmail, projectRepoFullName, task.repoType as RepoType);
+
+        // ✅ SOLO si aceptó invitación (ACTIVE) puede asignar/mover
+        if (membership?.state !== "ACTIVE") {
+          return res.status(403).json({
+            error: "repo_access_required",
+            state: membership?.state || "NONE",
+            repoUrl: membership?.repoUrl,
+          });
+        }
+      } catch (error: any) {
+        if (mapRepoErrorToResponse(error, res)) return;
+        throw error;
+      }
 
       const currentColumn = (task.columnId ?? "todo") as ColumnId;
       if (currentColumn !== "todo") {
@@ -1036,12 +1247,19 @@ router.post(
       }
 
       // ✅ generar spec y commitear en la rama
-      const spec = generateVerificationSpec({
-        id: String(task.id),
-        title: task.title,
-        description: task.description,
-        acceptanceCriteria: task.acceptanceCriteria,
-      }, projectStack);
+      const effectiveStack =
+        task.repoType === "hardhat"
+          ? await detectRepoStack(projectRepoFullName, branchName, doc.ownerEmail)
+          : projectStack;
+      const spec = generateVerificationSpec(
+        {
+          id: String(task.id),
+          title: task.title,
+          description: task.description,
+          acceptanceCriteria: task.acceptanceCriteria,
+        },
+        effectiveStack
+      );
 
       try {
         await ensureVerificationFilesInBranch(projectRepoFullName, branchName, spec, doc.ownerEmail);
@@ -1105,8 +1323,21 @@ router.post(
       await normalizeAndPersistTaskIds(doc);
       const projectStack: ProjectStack = normalizeProjectStack((doc.estimation as any)?.stack);
 
+      const estimation: any = doc.estimation || {};
+      const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
+
+      const task = tasks.find((t) => String(t.id) === String(taskId));
+      if (!task) return res.status(404).json({ error: "Tarea no encontrada" });
+
       try {
-        const membership = await ensureRepoMember(id, userEmail);
+        const repoInfo = resolveProjectRepo(doc, (task?.repoType || task?.repoKey) as RepoType | undefined);
+        const repoFullName = task?.repo?.repoFullName || repoInfo?.fullName;
+        const membership = await ensureRepoMember(
+          id,
+          userEmail,
+          repoFullName || undefined,
+          task?.repoType as RepoType
+        );
         if (!membership?.joined) {
           return res.status(403).json({ error: "repo_access_required" });
         }
@@ -1114,12 +1345,6 @@ router.post(
         if (mapRepoErrorToResponse(error, res)) return;
         throw error;
       }
-
-      const estimation: any = doc.estimation || {};
-      const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
-
-      const task = tasks.find((t) => String(t.id) === String(taskId));
-      if (!task) return res.status(404).json({ error: "Tarea no encontrada" });
 
       if (task.assigneeEmail !== userEmail) {
         return res.status(403).json({ error: "No eres el asignado a esta tarea" });
@@ -1132,11 +1357,8 @@ router.post(
       // ─────────────────────────────────────────────
       // ✅ OPCIÓN B: borrar rama SOLO si no hay commits
       // ─────────────────────────────────────────────
-      const repoFullName =
-        task?.repo?.repoFullName ||
-        (typeof doc.projectRepo === "string"
-          ? doc.projectRepo
-          : doc.projectRepo?.fullName || doc.projectRepo?.repoFullName || null);
+      const resolvedRepo = resolveProjectRepo(doc, (task.repoType || task.repoKey) as RepoType | undefined);
+      const repoFullName = task?.repo?.repoFullName || resolvedRepo?.fullName || null;
 
       const branch = task?.repo?.branch;
 
@@ -1212,21 +1434,28 @@ router.post(
       await normalizeAndPersistTaskIds(doc);
       const projectStack: ProjectStack = normalizeProjectStack((doc.estimation as any)?.stack);
 
+      const estimation: any = doc.estimation || {};
+      const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
+
+      const task = tasks.find((t) => String(t.id) === String(taskId));
+      if (!task) return res.status(404).json({ error: "Tarea no encontrada" });
+
       try {
-        const membership = await ensureRepoMember(id, userEmail);
-        if (!membership?.joined) {
+        const repoInfo = resolveProjectRepo(doc, (task.repoType || task.repoKey) as RepoType | undefined);
+        const repoFullName = task?.repo?.repoFullName || repoInfo?.fullName;
+        const membership = await ensureRepoMember(
+          id,
+          userEmail,
+          repoFullName || undefined,
+          task.repoType as RepoType
+        );
+        if (membership?.state !== "ACTIVE") {
           return res.status(403).json({ error: "repo_access_required" });
         }
       } catch (error: any) {
         if (mapRepoErrorToResponse(error, res)) return;
         throw error;
       }
-
-      const estimation: any = doc.estimation || {};
-      const tasks: any[] = Array.isArray(estimation.tasks) ? estimation.tasks : [];
-
-      const task = tasks.find((t) => String(t.id) === String(taskId));
-      if (!task) return res.status(404).json({ error: "Tarea no encontrada" });
 
       if (task.assigneeEmail !== userEmail) {
         return res.status(403).json({ error: "Solo el asignado puede enviarla a revisión" });
@@ -1238,13 +1467,15 @@ router.post(
 
       ensureTaskDefaults(task);
 
-      const projectRepoFullName =
-        typeof doc.projectRepo === "string"
-          ? doc.projectRepo
-          : doc.projectRepo?.fullName || doc.projectRepo?.repoFullName || null;
+      const repoInfo = resolveProjectRepo(doc, (task.repoType || task.repoKey) as RepoType | undefined);
+      const projectRepoFullName = repoInfo?.fullName;
 
       if (!task.repo) {
-        task.repo = { provider: "github", repoFullName: projectRepoFullName ?? undefined, checks: { status: "IDLE" } };
+        task.repo = {
+          provider: "github",
+          repoFullName: projectRepoFullName ?? undefined,
+          checks: { status: "IDLE" },
+        };
       }
 
       if (!task.repo.repoFullName && projectRepoFullName) {
@@ -1274,6 +1505,10 @@ router.post(
       if (!task.repo.branch) {
         task.repo.branch = branchName;
       }
+      const specStack =
+        task.repoType === "hardhat"
+          ? await detectRepoStack(task.repo.repoFullName || "", branchName, doc.ownerEmail)
+          : projectStack;
       const spec = generateVerificationSpec(
         {
           id: String(task.id),
@@ -1281,7 +1516,7 @@ router.post(
           description: task.description,
           acceptanceCriteria: task.acceptanceCriteria,
         },
-        projectStack
+        specStack
       );
 
       try {
@@ -1329,6 +1564,8 @@ router.post(
           taskId,
           branch,
           checklistKeys,
+          repoFullName: task.repo.repoFullName,
+          repoType: task.repoType as RepoType,
         });
       }
 
@@ -1365,6 +1602,23 @@ router.post(
 
       const task = tasks.find((t) => String(t.id) === String(taskId));
       if (!task) return res.status(404).json({ error: "Tarea no encontrada" });
+
+      try {
+        const repoInfo = resolveProjectRepo(doc, (task.repoType || task.repoKey) as RepoType | undefined);
+        const repoFullName = task?.repo?.repoFullName || repoInfo?.fullName;
+        const membership = await ensureRepoMember(
+          id,
+          userEmail,
+          repoFullName || undefined,
+          task.repoType as RepoType
+        );
+        if (membership?.state !== "ACTIVE") {
+          return res.status(403).json({ error: "repo_access_required" });
+        }
+      } catch (error: any) {
+        if (mapRepoErrorToResponse(error, res)) return;
+        throw error;
+      }
 
       if (task.assigneeEmail !== userEmail) {
         return res.status(403).json({ error: "Solo el asignado puede completarla" });
@@ -1506,12 +1760,10 @@ router.post(
 
       ensureTaskDefaults(task);
 
-      const projectRepoFullName =
-        typeof doc.projectRepo === "string"
-          ? doc.projectRepo
-          : doc.projectRepo?.fullName || doc.projectRepo?.repoFullName || null;
+      const repoInfo = resolveProjectRepo(doc, (task.repoType || task.repoKey) as RepoType | undefined);
+      const projectRepoFullName = repoInfo?.fullName;
 
-      const taskRepoFullName = task?.repo?.repoFullName || (task as any)?.repoFullName || null;
+      const taskRepoFullName = task?.repo?.repoFullName || (task as any)?.repoFullName || projectRepoFullName || null;
 
       const repoFullName = String(taskRepoFullName || projectRepoFullName || "").trim();
       if (!repoFullName || !repoFullName.includes("/")) {
@@ -1519,7 +1771,12 @@ router.post(
       }
 
       try {
-        const membership = await ensureRepoMember(id, userEmail);
+        const membership = await ensureRepoMember(
+          id,
+          userEmail,
+          repoFullName || undefined,
+          task.repoType as RepoType
+        );
         if (membership?.state !== "ACTIVE") {
           return res.status(403).json({
             error: "repo_access_required",
@@ -1564,6 +1821,10 @@ router.post(
       // asegurar spec en rama
       let spec = await fetchVerificationSpec(repoFullName, finalBranch, String(task.id), doc.ownerEmail);
       if (!spec) {
+        const stackForSpec =
+          task.repoType === "hardhat"
+            ? await detectRepoStack(repoFullName, finalBranch, doc.ownerEmail)
+            : projectStack;
         spec = generateVerificationSpec(
           {
             id: String(task.id),
@@ -1571,7 +1832,7 @@ router.post(
             description: task.description,
             acceptanceCriteria: task.acceptanceCriteria,
           },
-          projectStack
+          stackForSpec
         );
       }
 
