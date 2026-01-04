@@ -1,31 +1,18 @@
 // src/routes/projects.ts
 import express, { Request, Response } from 'express';
-import { HOURLY_RATE, PLATFORM_FEE_PERCENT, TASK_GENERATOR_FIXED_PRICE_EUR } from '../config/pricing';
 import { connectMongo } from '../db/mongo';
 import { ProjectModel, ProjectDocument } from '../models/Project';
-import { Subscription } from '../models/Subscription';
 import { TaskDocument } from '../models/Task';
 import { emitTaskEvent } from '../services/taskEvents';
 import mongoose from 'mongoose';
-import { generateProjectEstimationFromDescription } from "../services/generateTasks";
+import { handleGenerateTasks } from "../controllers/taskGenerationController";
+import { GenerateTasksRequestBody } from "../types/generateTasks";
 
 
 const router = express.Router();
 
 type ColumnId = TaskDocument['columnId'];
 type TaskLayer = TaskDocument['layer'];
-
-/**
- * Body esperado en /projects/generate-tasks
- * (compatibilidad con versiones previas: projectTitle/title, projectDescription/description)
- */
-interface GenerateTasksRequestBody {
-  ownerEmail: string;
-  projectTitle?: string;
-  projectDescription?: string;
-  title?: string;
-  description?: string;
-}
 
 // --- columnas del "board" tipo Trello ---
 export const DEFAULT_COLUMNS: Array<{ id: ColumnId; title: string; order: number }> = [
@@ -56,68 +43,6 @@ const mapTaskResponse = (task: TaskDocument) => ({
   assignedAt: task.assignedAt ?? null,
 });
 
-// --- reglas por categoría para estimar horas ---
-const categoryRules: Record<
-  TaskLayer,
-  { hours: number }
-> = {
-  ARCHITECTURE: { hours: 6 },
-  MODEL: { hours: 4 },
-  SERVICE: { hours: 3 },
-  VIEW: { hours: 2 },
-};
-
-const buildSampleTasks = (
-  projectTitle: string,
-  projectDescription: string
-): Array<Omit<TaskDocument, '_id'>> => {
-  const templates: Array<Pick<TaskDocument, 'title' | 'description' | 'layer'>> = [
-    {
-      title: 'Definir arquitectura y stack tecnológico',
-      description: `Arquitectura inicial para el proyecto: ${projectTitle}. ${projectDescription}`,
-      layer: 'ARCHITECTURE',
-    },
-    {
-      title: 'Diseñar modelos de datos y esquema de base de datos',
-      description: 'Modelado de entidades principales y relaciones.',
-      layer: 'MODEL',
-    },
-    {
-      title: 'Implementar servicios y lógica de negocio',
-      description: 'Endpoints y casos de uso principales del proyecto.',
-      layer: 'SERVICE',
-    },
-    {
-      title: 'Desarrollar capa de vista / frontend',
-      description: 'Pantallas iniciales y flujos de usuario clave.',
-      layer: 'VIEW',
-    },
-  ];
-
-  return templates.map((template, index) => {
-    const hours = categoryRules[template.layer].hours;
-    const price = Math.round(hours * HOURLY_RATE);
-
-    return {
-      title: template.title,
-      description: template.description,
-      priority: index + 1,
-      price,
-      layer: template.layer,
-      columnId: 'todo' as ColumnId,
-      status: 'TODO',
-      assignedToEmail: null,
-      assignedAt: null,
-      acceptanceCriteria: '',
-      verificationType: 'MANUAL',
-      verificationStatus: 'NOT_SUBMITTED',
-      verificationNotes: '',
-      verifiedByEmail: null,
-      verifiedAt: null,
-    };
-  });
-};
-
 const formatProject = (project: ProjectDocument) => {
   const data = project.toObject();
   return {
@@ -128,65 +53,12 @@ const formatProject = (project: ProjectDocument) => {
 
 /**
  * POST /projects/generate-tasks
- * Genera un proyecto con tareas troceadas y lo guarda en MongoDB
+ * Genera y devuelve tareas troceadas (OpenAI-first con fallback heurístico)
  */
 router.post(
   "/generate-tasks",
-  async (req: Request<unknown, unknown, GenerateTasksRequestBody>, res: Response) => {
-    try {
-      const { ownerEmail, projectTitle, projectDescription, title, description } = req.body || {};
-
-      const resolvedTitle = projectTitle ?? title;
-      const resolvedDescription = projectDescription ?? description;
-
-      if (!ownerEmail || !resolvedTitle || !resolvedDescription) {
-        return res.status(400).json({
-          error: "ownerEmail, projectTitle y projectDescription (o title/description) son obligatorios",
-        });
-      }
-
-      await connectMongo();
-      const subscription = await Subscription.findOne({ email: ownerEmail });
-
-      if (!subscription || subscription.status !== "active") {
-        return res.status(402).json({
-          error: "subscription_required",
-          message: "Necesitas una suscripción activa de 30 €/mes para generar el troceado de tareas.",
-        });
-      }
-
-      // ✅ AQUÍ estaba el mock (buildSampleTasks). Lo cambiamos por el generador real:
-      const estimation = generateProjectEstimationFromDescription({
-        ownerEmail,
-        projectTitle: resolvedTitle,
-        projectDescription: resolvedDescription,
-      });
-
-      const project = await ProjectModel.create({
-        ownerEmail,
-        title: resolvedTitle,
-        description: resolvedDescription,
-
-        tasks: estimation.tasks,
-        totalTasksPrice: estimation.totalTasksPrice,
-
-        generatorFee: 0, // lo cobras por suscripción
-        platformFeePercent: estimation.platformFeePercent,
-
-        // Si tu schema no tiene estos campos, bórralos:
-        platformFeeAmount: estimation.platformFeeAmount,
-        grandTotalClientCost: estimation.grandTotalClientCost,
-        stack: estimation.stack,
-
-        published: false,
-      });
-
-      return res.status(200).json({ project: formatProject(project) });
-    } catch (error) {
-      console.error("Error generando tareas:", error);
-      return res.status(500).json({ error: "Error interno al generar tareas" });
-    }
-  }
+  (req: Request<unknown, unknown, GenerateTasksRequestBody>, res: Response) =>
+    handleGenerateTasks(req, res)
 );
 
 
