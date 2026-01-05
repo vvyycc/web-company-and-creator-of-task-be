@@ -10,6 +10,7 @@ import billingRouter, { billingWebhookHandler } from "./routes/billing";
 import communityRouter from "./routes/community";
 import integrationsGithubRouter from "./routes/integrationsGithub";
 import githubWebhookRouter from "./routes/githubWebhook";
+import taskGeneratorRouter from "./routes/taskGenerator";
 import { connectMongo } from "./db/mongo";
 import { initSocket } from "./socket";
 
@@ -46,6 +47,7 @@ app.use(
 );
 
 app.use(express.json());
+app.use("/",taskGeneratorRouter);
 
 const EMAIL_REGEX = /^[\w.+-]+@[\w-]+\.[\w.-]+$/i;
 
