@@ -55,11 +55,11 @@ const formatProject = (project: ProjectDocument) => {
  * POST /projects/generate-tasks
  * Genera y devuelve tareas troceadas (OpenAI-first con fallback heurístico)
  */
-router.post(
-  "/generate-tasks",
-  (req: Request<unknown, unknown, GenerateTasksRequestBody>, res: Response) =>
-    handleGenerateTasks(req, res)
-);
+// router.post(
+//   "/generate-tasks",
+//   (req: Request<unknown, unknown, GenerateTasksRequestBody>, res: Response) =>
+//     handleGenerateTasks(req, res)
+// );
 
 
 /**

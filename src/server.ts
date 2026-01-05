@@ -47,7 +47,7 @@ app.use(
 );
 
 app.use(express.json());
-app.use(taskGeneratorRouter);
+app.use("/",taskGeneratorRouter);
 
 const EMAIL_REGEX = /^[\w.+-]+@[\w-]+\.[\w.-]+$/i;
 
