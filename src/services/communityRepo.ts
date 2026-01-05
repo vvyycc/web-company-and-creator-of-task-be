@@ -9,6 +9,8 @@ export type ProjectRepoInfo = {
   name?: string;
   fullName: string;
   htmlUrl: string;
+  defaultBranch?: string;
+  repoType?: "frontend" | "backend" | "hardhat";
 };
 
 type RepoContext = {
@@ -19,6 +21,7 @@ type RepoContext = {
   repoUrl: string;
   ownerEmail: string;
   ownerToken: string;
+  defaultBranch?: string;
 };
 
 export type RepoMemberState = "NONE" | "INVITED" | "ACTIVE";
@@ -144,15 +147,37 @@ export const isGithubIntegrationPermissionError = (error: any) =>
     error?.message || error?.responseBody || ""
   );
 
-async function getRepoContext(projectId: string): Promise<RepoContext> {
+function findRepoFromProject(doc: any, repoFullName?: string, repoType?: "frontend" | "backend" | "hardhat") {
+  const normalizedFull = repoFullName?.toLowerCase();
+  if (repoType && doc?.projectRepos?.[repoType]?.fullName) {
+    return doc.projectRepos[repoType];
+  }
+  if (normalizedFull) {
+    for (const key of ["frontend", "backend", "hardhat"] as const) {
+      const repo = doc?.projectRepos?.[key];
+      if (repo?.fullName && String(repo.fullName).toLowerCase() === normalizedFull) return repo;
+    }
+    if (doc?.projectRepo?.fullName && String(doc.projectRepo.fullName).toLowerCase() === normalizedFull) {
+      return doc.projectRepo;
+    }
+  }
+  return doc?.projectRepo;
+}
+
+async function getRepoContext(
+  projectId: string,
+  repoFullName?: string,
+  repoType?: "frontend" | "backend" | "hardhat"
+): Promise<RepoContext> {
   await connectMongo();
   const project = await CommunityProject.findById(projectId).lean();
   if (!project) throw new Error("community_project_not_found");
 
-  const repoFullName = project?.projectRepo?.fullName;
-  const repoUrl = project?.projectRepo?.htmlUrl;
+  const repoInfo = findRepoFromProject(project, repoFullName, repoType);
+  const repoNameFull = repoInfo?.fullName;
+  const repoUrl = repoInfo?.htmlUrl || repoInfo?.url;
 
-  if (!repoFullName || !repoUrl) {
+  if (!repoNameFull || !repoUrl) {
     throw new Error("project_repo_missing");
   }
 
@@ -161,7 +186,7 @@ async function getRepoContext(projectId: string): Promise<RepoContext> {
     throw new Error("github_not_connected_owner");
   }
 
-  const [repoOwner, repoName] = repoFullName.split("/");
+  const [repoOwner, repoName] = repoNameFull.split("/");
   if (!repoOwner || !repoName) {
     throw new Error("invalid_project_repo");
   }
@@ -170,10 +195,11 @@ async function getRepoContext(projectId: string): Promise<RepoContext> {
     projectId: String(projectId),
     repoOwner,
     repoName,
-    repoFullName,
+    repoFullName: repoNameFull,
     repoUrl,
     ownerEmail: project.ownerEmail,
     ownerToken: ownerAccount.accessToken,
+    defaultBranch: repoInfo?.defaultBranch,
   };
 }
 
@@ -295,9 +321,16 @@ export async function createProjectRepo(
 
 export async function dispatchVerifyWorkflow(
   projectId: string,
-  params: { taskId: string; branch: string; checklistKeys?: string[]; workflowNameOrId?: string }
+  params: {
+    taskId: string;
+    branch: string;
+    checklistKeys?: string[];
+    workflowNameOrId?: string;
+    repoFullName?: string;
+    repoType?: "frontend" | "backend" | "hardhat";
+  }
 ): Promise<boolean> {
-  const context = await getRepoContext(projectId);
+  const context = await getRepoContext(projectId, params.repoFullName, params.repoType);
   const client = createGithubClient(context.ownerToken);
   const { repoOwner, repoName } = context;
 
@@ -335,8 +368,13 @@ export async function dispatchVerifyWorkflow(
   }
 }
 
-async function checkRepoMembership(projectId: string, userEmail: string): Promise<RepoMemberStatus> {
-  const context = await getRepoContext(projectId);
+async function checkRepoMembership(
+  projectId: string,
+  userEmail: string,
+  repoFullName?: string,
+  repoType?: "frontend" | "backend" | "hardhat"
+): Promise<RepoMemberStatus> {
+  const context = await getRepoContext(projectId, repoFullName, repoType);
   const userAccount = await GithubAccount.findOne({ userEmail }).lean();
 
   // No tiene cuenta github conectada => no puede aceptar ni colaborar
@@ -405,12 +443,22 @@ async function checkRepoMembership(projectId: string, userEmail: string): Promis
   }
 }
 
-export async function ensureRepoMember(projectId: string, userEmail: string) {
-  return checkRepoMembership(projectId, userEmail);
+export async function ensureRepoMember(
+  projectId: string,
+  userEmail: string,
+  repoFullName?: string,
+  repoType?: "frontend" | "backend" | "hardhat"
+) {
+  return checkRepoMembership(projectId, userEmail, repoFullName, repoType);
 }
 
-export async function inviteUserToRepo(projectId: string, userEmail: string) {
-  const context = await getRepoContext(projectId);
+export async function inviteUserToRepo(
+  projectId: string,
+  userEmail: string,
+  repoFullName?: string,
+  repoType?: "frontend" | "backend" | "hardhat"
+) {
+  const context = await getRepoContext(projectId, repoFullName, repoType);
   const userAccount = await GithubAccount.findOne({ userEmail }).lean();
 
   if (!userAccount) {
