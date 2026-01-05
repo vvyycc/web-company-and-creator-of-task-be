@@ -18,6 +18,7 @@ export interface GeneratedTask {
 
   // para el board tipo Trello
   columnId: ColumnId;
+  repoType?: "backend" | "frontend" | "contracts";
 
   // alias legacy
   layer?: TaskCategory;

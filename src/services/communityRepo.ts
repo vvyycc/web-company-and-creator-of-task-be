@@ -11,6 +11,13 @@ export type ProjectRepoInfo = {
   htmlUrl: string;
 };
 
+export type ProjectRepoEntry = {
+  type: "backend" | "frontend" | "contracts" | "mono";
+  fullName: string;
+  htmlUrl: string;
+  name?: string;
+};
+
 type RepoContext = {
   projectId: string;
   repoOwner: string;
@@ -95,118 +102,26 @@ function safeRepoNameFromTitle(params: {
   return name;
 }
 
-// ================================
-// ✅ Bonus: descripción segura
-// ================================
-function sanitizeGithubDescription(input?: string): string {
-  if (!input) return "";
-  return input
-    .replace(/[\r\n\t]/g, " ")   // fuera control chars
-    .replace(/\s+/g, " ")        // colapsa espacios
-    .trim()
-    .slice(0, 200);              // ✅ (bonus) límite conservador
+function applyTypeSuffix(base: string, suffix: string) {
+  const cleanBase = base.replace(/-+$/g, "");
+  const fullSuffix = suffix ? `-${slugifyRepoName(suffix)}` : "";
+  const maxBaseLength = MAX_REPO_NAME - fullSuffix.length;
+  const trimmedBase = cleanBase.slice(0, Math.max(1, maxBaseLength)).replace(/-+$/g, "");
+  return `${trimmedBase}${fullSuffix}`;
 }
 
-// (lo dejo por compatibilidad, pero ya NO se usa para repoName)
-const slugify = (value: string, fallback: string) => {
-  const base = value
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, "")
-    .trim()
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "");
-
-  return base || `project-${fallback}`;
-};
-
-const buildReadmeContent = (title: string, description: string) => {
-  const safeTitle = title?.trim() || "Proyecto";
-  const safeDescription = description?.trim() || "";
-  return `# ${safeTitle}\n\n${safeDescription}\n`;
-};
-
-const getVerifyWorkflowTemplate = () => {
-  const templatePath = path.join(__dirname, "../../github/workflows/verify.yml");
-  try {
-    return fs.readFileSync(templatePath, "utf8");
-  } catch (error) {
-    console.warn("[community:repo] No se pudo leer plantilla verify.yml", error);
-    return null;
-  }
-};
-
-export const isGithubIntegrationPermissionError = (error: any) =>
-  error?.status === 403 &&
-  /Resource not accessible by integration/i.test(
-    error?.message || error?.responseBody || ""
-  );
-
-async function getRepoContext(projectId: string): Promise<RepoContext> {
-  await connectMongo();
-  const project = await CommunityProject.findById(projectId).lean();
-  if (!project) throw new Error("community_project_not_found");
-
-  const repoFullName = project?.projectRepo?.fullName;
-  const repoUrl = project?.projectRepo?.htmlUrl;
-
-  if (!repoFullName || !repoUrl) {
-    throw new Error("project_repo_missing");
-  }
-
-  const ownerAccount = await GithubAccount.findOne({ userEmail: project.ownerEmail }).lean();
-  if (!ownerAccount) {
-    throw new Error("github_not_connected_owner");
-  }
-
-  const [repoOwner, repoName] = repoFullName.split("/");
-  if (!repoOwner || !repoName) {
-    throw new Error("invalid_project_repo");
-  }
-
-  return {
-    projectId: String(projectId),
-    repoOwner,
-    repoName,
-    repoFullName,
-    repoUrl,
-    ownerEmail: project.ownerEmail,
-    ownerToken: ownerAccount.accessToken,
-  };
-}
-
-export async function createProjectRepo(
-  ownerEmail: string,
-  projectId: string,
-  projectTitle: string,
-  projectDescription: string
-): Promise<ProjectRepoInfo> {
-  await connectMongo();
-  const ownerAccount = await GithubAccount.findOne({ userEmail: ownerEmail }).lean();
-  if (!ownerAccount) {
-    throw new Error("github_not_connected_owner");
-  }
-
-  const client = createGithubClient(ownerAccount.accessToken);
-
-  // ✅ Nombre seguro: <= 100 chars, sin emojis, con sufijo por projectId
-  const repoNameBase = safeRepoNameFromTitle({
-    projectTitle,
-    projectId,
-    prefix: "community", // opcional (puedes quitarlo si no lo quieres)
-  });
-
+async function pickAvailableRepoName(
+  client: ReturnType<typeof createGithubClient>,
+  ownerLogin: string,
+  repoNameBase: string,
+  projectId: string
+) {
   let repoName = repoNameBase;
-
-  // ✅ Si ya existe un repo con ese nombre, añade sufijo extra corto (y vuelve a limitar a 100)
   try {
-    await client.getRepo(ownerAccount.githubLogin, repoNameBase);
+    await client.getRepo(ownerLogin, repoNameBase);
 
     const extra = projectId.slice(-6).toLowerCase();
-    // añade un segundo sufijo, recortando para no pasarse
-    const tentative = `${repoNameBase}-${extra}`;
+    const tentative = applyTypeSuffix(repoNameBase, extra);
     repoName =
       tentative.length <= MAX_REPO_NAME
         ? tentative
@@ -216,6 +131,21 @@ export async function createProjectRepo(
       throw error;
     }
   }
+
+  return repoName;
+}
+
+async function createRepoWithClient(params: {
+  client: ReturnType<typeof createGithubClient>;
+  ownerAccount: any;
+  repoNameBase: string;
+  projectId: string;
+  projectTitle: string;
+  projectDescription: string;
+}): Promise<ProjectRepoInfo> {
+  const { client, ownerAccount, repoNameBase, projectId, projectTitle, projectDescription } = params;
+
+  const repoName = await pickAvailableRepoName(client, ownerAccount.githubLogin, repoNameBase, projectId);
 
   let createdRepo;
   try {
@@ -266,7 +196,7 @@ export async function createProjectRepo(
   }
 
   console.log(
-    `[community:repo] repo created project=${projectId} repo=${createdRepo?.full_name} owner=${ownerEmail}`
+    `[community:repo] repo created project=${projectId} repo=${createdRepo?.full_name} owner=${ownerAccount?.userEmail}`
   );
 
   if (workflowTemplate) {
@@ -293,11 +223,217 @@ export async function createProjectRepo(
   };
 }
 
+// ================================
+// ✅ Bonus: descripción segura
+// ================================
+function sanitizeGithubDescription(input?: string): string {
+  if (!input) return "";
+  return input
+    .replace(/[\r\n\t]/g, " ")   // fuera control chars
+    .replace(/\s+/g, " ")        // colapsa espacios
+    .trim()
+    .slice(0, 200);              // ✅ (bonus) límite conservador
+}
+
+// (lo dejo por compatibilidad, pero ya NO se usa para repoName)
+const slugify = (value: string, fallback: string) => {
+  const base = value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return base || `project-${fallback}`;
+};
+
+const buildReadmeContent = (title: string, description: string) => {
+  const safeTitle = title?.trim() || "Proyecto";
+  const safeDescription = description?.trim() || "";
+  return `# ${safeTitle}\n\n${safeDescription}\n`;
+};
+
+const getVerifyWorkflowTemplate = () => {
+  const templatePath = path.join(__dirname, "../../github/workflows/verify.yml");
+  try {
+    return fs.readFileSync(templatePath, "utf8");
+  } catch (error) {
+    console.warn("[community:repo] No se pudo leer plantilla verify.yml", error);
+    return null;
+  }
+};
+
+export const isGithubIntegrationPermissionError = (error: any) =>
+  error?.status === 403 &&
+  /Resource not accessible by integration/i.test(
+    error?.message || error?.responseBody || ""
+  );
+
+function normalizeProjectRepos(project: any): ProjectRepoEntry[] {
+  const reposRaw = Array.isArray(project?.projectRepos) ? project.projectRepos : [];
+  return reposRaw
+    .map((r: any) => ({
+      type: r?.type,
+      fullName: r?.fullName,
+      htmlUrl: r?.htmlUrl,
+      name: r?.name,
+    }))
+    .filter((r: ProjectRepoEntry) => r.fullName);
+}
+
+async function getRepoContext(projectId: string, repoFullName?: string): Promise<RepoContext> {
+  await connectMongo();
+  const project = await CommunityProject.findById(projectId).lean();
+  if (!project) throw new Error("community_project_not_found");
+
+  const projectRepos = normalizeProjectRepos(project);
+
+  let repoUrl: string | undefined;
+  let resolvedRepoFullName =
+    repoFullName ||
+    project?.projectRepo?.fullName ||
+    (typeof (project as any)?.projectRepo === "string" ? (project as any).projectRepo : undefined) ||
+    (project as any)?.projectRepo?.repoFullName;
+
+  if (repoFullName) {
+    const found = projectRepos.find(
+      (r) => r.fullName.toLowerCase() === String(repoFullName).toLowerCase()
+    );
+    if (found?.fullName) {
+      resolvedRepoFullName = found.fullName;
+      repoUrl = found.htmlUrl;
+    }
+  } else if (projectRepos.length) {
+    const backendRepo = projectRepos.find((r) => r.type === "backend");
+    const fallbackRepo = backendRepo || projectRepos[0];
+    resolvedRepoFullName = fallbackRepo?.fullName || resolvedRepoFullName;
+    repoUrl = fallbackRepo?.htmlUrl;
+  } else {
+    repoUrl = project?.projectRepo?.htmlUrl;
+  }
+
+  if (!resolvedRepoFullName) {
+    throw new Error("project_repo_missing");
+  }
+
+  const ownerAccount = await GithubAccount.findOne({ userEmail: project.ownerEmail }).lean();
+  if (!ownerAccount) {
+    throw new Error("github_not_connected_owner");
+  }
+
+  const [repoOwner, repoName] = resolvedRepoFullName.split("/");
+  if (!repoOwner || !repoName) {
+    throw new Error("invalid_project_repo");
+  }
+
+  return {
+    projectId: String(projectId),
+    repoOwner,
+    repoName,
+    repoFullName: resolvedRepoFullName,
+    repoUrl: repoUrl || `https://github.com/${repoOwner}/${repoName}`,
+    ownerEmail: project.ownerEmail,
+    ownerToken: ownerAccount.accessToken,
+  };
+}
+
+export async function createProjectRepo(
+  ownerEmail: string,
+  projectId: string,
+  projectTitle: string,
+  projectDescription: string
+): Promise<ProjectRepoInfo> {
+  await connectMongo();
+  const ownerAccount = await GithubAccount.findOne({ userEmail: ownerEmail }).lean();
+  if (!ownerAccount) {
+    throw new Error("github_not_connected_owner");
+  }
+
+  const client = createGithubClient(ownerAccount.accessToken);
+
+  const repoNameBase = safeRepoNameFromTitle({
+    projectTitle,
+    projectId,
+    prefix: "community",
+  });
+
+  return createRepoWithClient({
+    client,
+    ownerAccount,
+    repoNameBase,
+    projectId,
+    projectTitle,
+    projectDescription,
+  });
+}
+
+export async function createProjectRepos(
+  ownerEmail: string,
+  projectId: string,
+  projectTitle: string,
+  projectDescription: string,
+  flags?: { contracts?: boolean }
+): Promise<ProjectRepoEntry[]> {
+  await connectMongo();
+  const ownerAccount = await GithubAccount.findOne({ userEmail: ownerEmail }).lean();
+  if (!ownerAccount) {
+    throw new Error("github_not_connected_owner");
+  }
+
+  const client = createGithubClient(ownerAccount.accessToken);
+
+  const repoNameBase = safeRepoNameFromTitle({
+    projectTitle,
+    projectId,
+    prefix: "community",
+  });
+
+  const reposToCreate: Array<"backend" | "frontend" | "contracts"> = ["backend", "frontend"];
+  if (flags?.contracts) reposToCreate.push("contracts");
+
+  const created: ProjectRepoEntry[] = [];
+
+  try {
+    for (const type of reposToCreate) {
+      const repoName = applyTypeSuffix(repoNameBase, type);
+      const info = await createRepoWithClient({
+        client,
+        ownerAccount,
+        repoNameBase: repoName,
+        projectId,
+        projectTitle,
+        projectDescription,
+      });
+
+      created.push({
+        type,
+        fullName: info.fullName,
+        htmlUrl: info.htmlUrl,
+        name: info.name,
+      });
+    }
+  } catch (error: any) {
+    (error as any).createdRepos = created;
+    throw error;
+  }
+
+  return created;
+}
+
 export async function dispatchVerifyWorkflow(
   projectId: string,
-  params: { taskId: string; branch: string; checklistKeys?: string[]; workflowNameOrId?: string }
+  params: {
+    taskId: string;
+    branch: string;
+    checklistKeys?: string[];
+    workflowNameOrId?: string;
+    repoFullName?: string;
+  }
 ): Promise<boolean> {
-  const context = await getRepoContext(projectId);
+  const context = await getRepoContext(projectId, params.repoFullName);
   const client = createGithubClient(context.ownerToken);
   const { repoOwner, repoName } = context;
 
@@ -335,8 +471,12 @@ export async function dispatchVerifyWorkflow(
   }
 }
 
-async function checkRepoMembership(projectId: string, userEmail: string): Promise<RepoMemberStatus> {
-  const context = await getRepoContext(projectId);
+async function checkRepoMembership(
+  projectId: string,
+  userEmail: string,
+  repoFullName?: string
+): Promise<RepoMemberStatus> {
+  const context = await getRepoContext(projectId, repoFullName);
   const userAccount = await GithubAccount.findOne({ userEmail }).lean();
 
   // No tiene cuenta github conectada => no puede aceptar ni colaborar
@@ -409,6 +549,14 @@ export async function ensureRepoMember(projectId: string, userEmail: string) {
   return checkRepoMembership(projectId, userEmail);
 }
 
+export async function ensureRepoMemberForRepo(
+  projectId: string,
+  repoFullName: string,
+  userEmail: string
+) {
+  return checkRepoMembership(projectId, userEmail, repoFullName);
+}
+
 export async function inviteUserToRepo(projectId: string, userEmail: string) {
   const context = await getRepoContext(projectId);
   const userAccount = await GithubAccount.findOne({ userEmail }).lean();
@@ -440,6 +588,51 @@ export async function inviteUserToRepo(projectId: string, userEmail: string) {
 
   console.log(
     `[community:repo] invite sent project=${projectId} user=${userEmail} login=${userAccount.githubLogin}`
+  );
+
+  return {
+    joined: true,
+    state: "INVITED",
+    repoFullName: context.repoFullName,
+    repoUrl: context.repoUrl,
+  };
+}
+
+export async function inviteUserToRepoForRepo(
+  projectId: string,
+  repoFullName: string,
+  userEmail: string
+) {
+  const context = await getRepoContext(projectId, repoFullName);
+  const userAccount = await GithubAccount.findOne({ userEmail }).lean();
+
+  if (!userAccount) {
+    throw new Error("github_account_not_found");
+  }
+
+  const membership = await checkRepoMembership(projectId, userEmail, repoFullName);
+  if (membership.joined) {
+    return membership;
+  }
+
+  const client = createGithubClient(context.ownerToken);
+
+  try {
+    await client.inviteCollaborator(context.repoOwner, context.repoName, userAccount.githubLogin);
+  } catch (error: any) {
+    if (isGithubIntegrationPermissionError(error)) {
+      console.error(
+        `[community:repo] No se pudo invitar por permisos faltantes (Resource not accessible by integration): project=${projectId}, repo=${repoFullName}, user=${userEmail}`
+      );
+      const wrapped: any = new Error(GITHUB_PERMISSION_ERROR);
+      wrapped.code = GITHUB_PERMISSION_ERROR;
+      throw wrapped;
+    }
+    throw error;
+  }
+
+  console.log(
+    `[community:repo] invite sent project=${projectId} repo=${context.repoFullName} user=${userEmail} login=${userAccount.githubLogin}`
   );
 
   return {
