@@ -26,6 +26,12 @@ export interface CommunityProjectDocument extends Document {
   projectDescription: string;
   estimation: ProjectEstimation;
   stack?: ProjectStack;
+  projectRepos?: {
+    type: "mono" | "backend" | "frontend" | "contracts";
+    name?: string;
+    fullName: string;
+    htmlUrl: string;
+  }[];
   projectRepo?: {
     name?: string;
     fullName: string;
@@ -48,6 +54,14 @@ const CommunityProjectSchema = new Schema<CommunityProjectDocument>(
       fullName: { type: String },
       htmlUrl: { type: String },
     },
+    projectRepos: [
+      {
+        type: { type: String },
+        name: { type: String },
+        fullName: { type: String },
+        htmlUrl: { type: String },
+      },
+    ],
     stack: { type: Schema.Types.Mixed, default: DEFAULT_PROJECT_STACK },
     isPublished: { type: Boolean, default: true },
   },

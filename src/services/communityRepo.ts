@@ -11,6 +11,8 @@ export type ProjectRepoInfo = {
   htmlUrl: string;
 };
 
+export type ProjectRepoType = "mono" | "backend" | "frontend" | "contracts";
+
 type RepoContext = {
   projectId: string;
   repoOwner: string;
@@ -95,6 +97,22 @@ function safeRepoNameFromTitle(params: {
   return name;
 }
 
+function buildRepoNameForType(baseName: string, projectId: string, type: ProjectRepoType) {
+  const repoNameBase = safeRepoNameFromTitle({
+    projectTitle: baseName,
+    projectId,
+    prefix: "community",
+  });
+
+  if (type === "mono") return repoNameBase;
+
+  const suffix = type === "backend" ? "-backend" : type === "frontend" ? "-frontend" : "-contracts";
+  const maxBaseLength = MAX_REPO_NAME - suffix.length;
+  const trimmedBase = repoNameBase.slice(0, Math.max(1, maxBaseLength)).replace(/-+$/g, "");
+
+  return `${trimmedBase}${suffix}`;
+}
+
 // ================================
 // ✅ Bonus: descripción segura
 // ================================
@@ -149,10 +167,24 @@ async function getRepoContext(projectId: string): Promise<RepoContext> {
   const project = await CommunityProject.findById(projectId).lean();
   if (!project) throw new Error("community_project_not_found");
 
-  const repoFullName = project?.projectRepo?.fullName;
-  const repoUrl = project?.projectRepo?.htmlUrl;
+  const repoFromProject: any = (project as any)?.projectRepo;
+  const repoFullName = repoFromProject?.fullName;
+  const repoUrl = repoFromProject?.htmlUrl;
+  const repoFromList: any =
+    Array.isArray((project as any)?.projectRepos) && (project as any).projectRepos.length
+      ? (project as any).projectRepos[0]
+      : null;
 
-  if (!repoFullName || !repoUrl) {
+  const finalRepoFullName =
+    repoFullName ||
+    repoFromProject?.repoFullName ||
+    (typeof repoFromProject === "string" ? repoFromProject : undefined) ||
+    repoFromList?.fullName ||
+    repoFromList?.repoFullName;
+
+  const finalRepoUrl = repoUrl || repoFromList?.htmlUrl || repoFromList?.repoUrl;
+
+  if (!finalRepoFullName || !finalRepoUrl) {
     throw new Error("project_repo_missing");
   }
 
@@ -161,7 +193,7 @@ async function getRepoContext(projectId: string): Promise<RepoContext> {
     throw new Error("github_not_connected_owner");
   }
 
-  const [repoOwner, repoName] = repoFullName.split("/");
+  const [repoOwner, repoName] = finalRepoFullName.split("/");
   if (!repoOwner || !repoName) {
     throw new Error("invalid_project_repo");
   }
@@ -170,34 +202,21 @@ async function getRepoContext(projectId: string): Promise<RepoContext> {
     projectId: String(projectId),
     repoOwner,
     repoName,
-    repoFullName,
-    repoUrl,
+    repoFullName: finalRepoFullName,
+    repoUrl: finalRepoUrl,
     ownerEmail: project.ownerEmail,
     ownerToken: ownerAccount.accessToken,
   };
 }
 
-export async function createProjectRepo(
-  ownerEmail: string,
+async function createRepoWithName(
+  ownerAccount: any,
+  repoNameBase: string,
   projectId: string,
   projectTitle: string,
   projectDescription: string
 ): Promise<ProjectRepoInfo> {
-  await connectMongo();
-  const ownerAccount = await GithubAccount.findOne({ userEmail: ownerEmail }).lean();
-  if (!ownerAccount) {
-    throw new Error("github_not_connected_owner");
-  }
-
   const client = createGithubClient(ownerAccount.accessToken);
-
-  // ✅ Nombre seguro: <= 100 chars, sin emojis, con sufijo por projectId
-  const repoNameBase = safeRepoNameFromTitle({
-    projectTitle,
-    projectId,
-    prefix: "community", // opcional (puedes quitarlo si no lo quieres)
-  });
-
   let repoName = repoNameBase;
 
   // ✅ Si ya existe un repo con ese nombre, añade sufijo extra corto (y vuelve a limitar a 100)
@@ -266,7 +285,7 @@ export async function createProjectRepo(
   }
 
   console.log(
-    `[community:repo] repo created project=${projectId} repo=${createdRepo?.full_name} owner=${ownerEmail}`
+    `[community:repo] repo created project=${projectId} repo=${createdRepo?.full_name} owner=${ownerAccount?.userEmail}`
   );
 
   if (workflowTemplate) {
@@ -291,6 +310,32 @@ export async function createProjectRepo(
     fullName: createdRepo?.full_name ?? `${repoOwnerLogin}/${repoName}`,
     htmlUrl: createdRepo?.html_url,
   };
+}
+
+export async function createProjectRepo(
+  ownerEmail: string,
+  projectId: string,
+  projectTitle: string,
+  projectDescription: string
+): Promise<ProjectRepoInfo> {
+  return createProjectRepoForType(ownerEmail, projectId, projectTitle, projectDescription, "mono");
+}
+
+export async function createProjectRepoForType(
+  ownerEmail: string,
+  projectId: string,
+  baseName: string,
+  projectDescription: string,
+  type: ProjectRepoType
+): Promise<ProjectRepoInfo> {
+  await connectMongo();
+  const ownerAccount = await GithubAccount.findOne({ userEmail: ownerEmail }).lean();
+  if (!ownerAccount) {
+    throw new Error("github_not_connected_owner");
+  }
+
+  const repoNameBase = buildRepoNameForType(baseName, projectId, type);
+  return createRepoWithName(ownerAccount, repoNameBase, projectId, baseName, projectDescription);
 }
 
 export async function dispatchVerifyWorkflow(
