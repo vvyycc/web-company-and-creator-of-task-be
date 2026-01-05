@@ -5,14 +5,15 @@ import { connectMongo } from "../db/mongo";
 import { CommunityProject } from "../models/CommunityProject";
 import { getIO } from "../socket";
 import {
-  createProjectRepo,
   dispatchVerifyWorkflow,
   ensureRepoMember,
   inviteUserToRepo,
   isGithubIntegrationPermissionError,
+  createProjectRepoForType,
+  ProjectRepoType,
 } from "../services/communityRepo";
 
-import { getOctokitForEmail } from "../services/github";
+import { deleteGithubRepoForOwner, getOctokitForEmail } from "../services/github";
 import {
   buildChecklistFromSpec,
   buildTaskBranchName,
@@ -407,6 +408,74 @@ export const mapTaskToBoard = (task: any): BoardTask => {
   };
 };
 
+const BACKEND_KEYWORDS = ["backend", "api", "server", "db"];
+const FRONTEND_KEYWORDS = ["frontend", "ui", "view", "next", "react"];
+const CONTRACTS_KEYWORDS = ["web3", "solidity", "hardhat", "contract", "smart"];
+
+const matchKeywords = (text: string, keywords: string[]) => {
+  const normalized = String(text || "").toLowerCase();
+  return keywords.some((kw) => normalized.includes(kw));
+};
+
+const detectRepoTypesFromEstimation = (estimation: any): ProjectRepoType[] => {
+  const tasks: any[] = Array.isArray(estimation?.tasks) ? estimation.tasks : [];
+  const stack = estimation?.stack as ProjectStack | undefined;
+  const types = new Set<ProjectRepoType>();
+
+  const checkTask = (task: any) => {
+    const tags: string[] = Array.isArray(task?.tags) ? task.tags : [];
+
+    if (tags.some((tag) => matchKeywords(tag, BACKEND_KEYWORDS)) ||
+      matchKeywords(task?.title, BACKEND_KEYWORDS) ||
+      matchKeywords(task?.description, BACKEND_KEYWORDS)) {
+      types.add("backend");
+    }
+
+    if (tags.some((tag) => matchKeywords(tag, FRONTEND_KEYWORDS)) ||
+      matchKeywords(task?.title, FRONTEND_KEYWORDS) ||
+      matchKeywords(task?.description, FRONTEND_KEYWORDS)) {
+      types.add("frontend");
+    }
+
+    if (tags.some((tag) => matchKeywords(tag, CONTRACTS_KEYWORDS)) ||
+      matchKeywords(task?.title, CONTRACTS_KEYWORDS) ||
+      matchKeywords(task?.description, CONTRACTS_KEYWORDS)) {
+      types.add("contracts");
+    }
+  };
+
+  tasks.forEach(checkTask);
+
+  if (stack) {
+    const stackStrings = [
+      stack.primary,
+      (stack as any).framework,
+      (stack as any).notes,
+    ]
+      .map((v) => String(v || "").toLowerCase())
+      .filter(Boolean);
+
+    const hasStackKeyword = (keywords: string[]) =>
+      stackStrings.some((s) => keywords.some((kw) => s.includes(kw)));
+
+    if (hasStackKeyword(["node", "express", "django"])) {
+      types.add("backend");
+    }
+    if (hasStackKeyword(["next", "react"])) {
+      types.add("frontend");
+    }
+    if (hasStackKeyword(["hardhat", "solidity"])) {
+      types.add("contracts");
+    }
+  }
+
+  const orderedTypes: ProjectRepoType[] = ["backend", "frontend", "contracts"];
+  const result = orderedTypes.filter((t) => types.has(t));
+
+  if (!result.length) return ["mono"];
+  return result;
+};
+
 export const emitBoardUpdate = (projectId: string, tasks: any[]) => {
   const io = getIO();
   io.to(`community:${projectId}`).emit("community:boardUpdated", {
@@ -572,7 +641,7 @@ router.post(
       // const docData: any = { ..., technicalChecklist }
 
       // ✅ crear doc con el mismo newId
-      const doc: any = await CommunityProject.create({
+      const doc: any = new CommunityProject({
         _id: newId,
         ownerEmail,
         projectTitle,
@@ -583,26 +652,73 @@ router.post(
         isPublished: true,
       });
 
-      // ✅ Crear repo en GitHub al publicar (y guardar en doc.projectRepo)
-      try {
-        const repoInfo = await createProjectRepo(
-          ownerEmail,
-          newId.toString(),
-          projectTitle,
-          projectDescription
-        );
+      const repoTypes = detectRepoTypesFromEstimation(estimation);
+      const createdRepos: { type: ProjectRepoType; info: { name?: string; fullName: string; htmlUrl: string } }[] = [];
 
-        doc.projectRepo = repoInfo;
+      // ✅ Crear repo(s) en GitHub al publicar (y guardar en doc.projectRepo/projectRepos)
+      try {
+        for (const type of repoTypes) {
+          const repoInfo = await createProjectRepoForType(
+            ownerEmail,
+            newId.toString(),
+            projectTitle,
+            projectDescription,
+            type
+          );
+          createdRepos.push({ type, info: repoInfo });
+        }
+
+        if (createdRepos.length) {
+          const [primaryRepo] = createdRepos;
+          doc.projectRepo = {
+            name: primaryRepo?.info?.name,
+            fullName: primaryRepo?.info?.fullName,
+            htmlUrl: primaryRepo?.info?.htmlUrl,
+          };
+          doc.projectRepos = createdRepos.map((repo) => ({
+            type: repo.type,
+            name: repo.info.name,
+            fullName: repo.info.fullName,
+            htmlUrl: repo.info.htmlUrl,
+          }));
+        }
+
         await doc.save();
 
         const io = getIO();
         io.to(`community:${newId.toString()}`).emit("community:repoCreated", {
           projectId: newId.toString(),
-          repoFullName: repoInfo.fullName,
-          repoUrl: repoInfo.htmlUrl,
+          repoFullName: doc.projectRepo?.fullName,
+          repoUrl: doc.projectRepo?.htmlUrl,
+          projectRepos: doc.projectRepos,
         });
       } catch (repoError: any) {
-        await doc.deleteOne();
+        for (const repo of createdRepos) {
+          try {
+            if (repo?.info?.fullName) {
+              await deleteGithubRepoForOwner(ownerEmail, repo.info.fullName);
+              console.log("[community:repo] cleanup repo deleted", {
+                projectId: newId.toString(),
+                repo: repo.info.fullName,
+              });
+            }
+          } catch (cleanupError: any) {
+            console.warn("[community:repo] cleanup delete failed", {
+              projectId: newId.toString(),
+              repo: repo?.info?.fullName,
+              status: cleanupError?.status,
+              message: cleanupError?.message,
+            });
+          }
+        }
+
+        try {
+          if (!doc.isNew) {
+            await doc.deleteOne();
+          }
+        } catch (deleteError) {
+          console.warn("[community] No se pudo borrar doc tras error de repo", deleteError);
+        }
         if (mapRepoErrorToResponse(repoError, res)) return;
 
         console.error("[community] Error creando repo de proyecto:", repoError);
